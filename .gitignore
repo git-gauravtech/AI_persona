@@ -1,0 +1,23 @@
+# Environment
+.env
+venv/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Frontend / Vercel
+.vercel/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Data files
+backend/data/
+data/
