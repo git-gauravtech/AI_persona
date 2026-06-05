@@ -417,6 +417,8 @@
   <p class="disclaimer">AI representative powered by RAG · Grounded in Gaurav's resume and GitHub data</p>
 </footer>
 
+<script src="/config.js"></script>
+
 <script>
 /*
   CONFIG
@@ -427,7 +429,9 @@
   After backend deployment:
   const API_URL = "https://your-backend-url.onrender.com/chat";
 */
-const API_URL = "http://localhost:8000/chat";
+
+const API_URL =
+  window.APP_CONFIG?.API_URL || "http://localhost:8000/chat";
 
 const PERSONA_NAME = "Gaurav Saklani";
 const INITIALS = "GS";

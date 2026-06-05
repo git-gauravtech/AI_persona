@@ -3,8 +3,6 @@ uvicorn[standard]
 python-dotenv
 groq
 pinecone
-sentence-transformers
+fastembed
 httpx
 pydantic
-tqdm
-pdfplumber

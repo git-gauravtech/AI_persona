@@ -1,10 +1,10 @@
 """
 embed_and_upsert.py
-Reads data/processed/parsed_chunks.json, embeds each chunk using a free local
-SentenceTransformer model, and upserts into Pinecone.
+Reads data/processed/parsed_chunks.json, embeds each chunk using FastEmbed,
+and upserts into Pinecone.
 
 Requirements:
-    pip install sentence-transformers pinecone tqdm python-dotenv
+    pip install fastembed pinecone tqdm python-dotenv
 """
 
 import json
@@ -15,7 +15,7 @@ from pathlib import Path
 from tqdm import tqdm
 from dotenv import load_dotenv
 
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from pinecone import Pinecone, ServerlessSpec
 
 load_dotenv()
@@ -25,7 +25,7 @@ PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
 INDEX_NAME = "ai-persona-local"
 NAMESPACE = "gaurav-ai-persona"
 
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 EMBEDDING_DIM = 384
 
 BATCH_SIZE = 64
@@ -33,8 +33,8 @@ SLEEP_BETWEEN_BATCHES = 0.3
 
 INPUT_FILE = Path("data/processed/parsed_chunks.json")
 
-print(f"Loading local embedding model: {EMBEDDING_MODEL}")
-embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+print(f"Loading FastEmbed model: {EMBEDDING_MODEL}")
+embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL)
 
 
 def make_id(text: str, metadata: dict) -> str:
@@ -48,12 +48,16 @@ def make_id(text: str, metadata: dict) -> str:
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    embeddings = embedding_model.encode(
-        texts,
-        normalize_embeddings=True,
-        show_progress_bar=False
-    )
-    return embeddings.tolist()
+    embeddings = list(embedding_model.embed(texts))
+
+    vectors = []
+    for emb in embeddings:
+        if hasattr(emb, "tolist"):
+            vectors.append(emb.tolist())
+        else:
+            vectors.append(list(emb))
+
+    return vectors
 
 
 def init_pinecone_index():

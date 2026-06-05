@@ -21,3 +21,4 @@ __pycache__/
 # Data files
 backend/data/
 data/
+frontend/config.js

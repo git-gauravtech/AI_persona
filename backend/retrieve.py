@@ -1,43 +1,23 @@
-"""
-retrieve.py
-Retrieval layer for Gaurav AI Persona.
-
-Uses:
-- Local SentenceTransformer embeddings
-- Pinecone vector DB
-- Metadata-aware smart routing
-- Light reranking for better answer quality
-
-Used by:
-- chat_api.py
-- future voice endpoint / Vapi tool
-"""
-
 import os
 import re
 from dotenv import load_dotenv
 from pinecone import Pinecone
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 load_dotenv()
 
-# ── CONFIG ───────────────────────────────────────────────────────────────────
 PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
 
 INDEX_NAME = "ai-persona-local"
 NAMESPACE = "gaurav-ai-persona"
 
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
-# Chat can use more context.
 TOP_K_CHAT = 6
-
-# Voice should use fewer chunks for latency and concise answers.
 TOP_K_VOICE = 3
-# ─────────────────────────────────────────────────────────────────────────────
 
-print(f"Loading retrieval embedding model: {EMBEDDING_MODEL}")
-embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+print(f"Loading FastEmbed retrieval model: {EMBEDDING_MODEL}")
+embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL)
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(INDEX_NAME)
@@ -134,14 +114,13 @@ def detect_repo(query: str) -> str | None:
 
 
 def embed_query(query: str) -> list[float]:
-    """Embed a single query using local embedding model."""
-    embedding = embedding_model.encode(
-        query,
-        normalize_embeddings=True,
-        show_progress_bar=False
-    )
-    return embedding.tolist()
+    """Embed a single query using FastEmbed."""
+    embedding = next(embedding_model.embed([query]))
 
+    if hasattr(embedding, "tolist"):
+        return embedding.tolist()
+
+    return list(embedding)
 
 def retrieve(
     query: str,
