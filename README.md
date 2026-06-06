@@ -596,19 +596,14 @@ Booking: Cal.com API calls + Groq parsing calls
 
 ## Known Failure Modes and Fixes
 
-### 1. Groq rate limit caused raw 429 error
 
-Root cause: all Groq calls used one API key.
-
-Fix: added `llm_client.py` with 4-key fallback and fallback model.
-
-### 2. Voice transcription misunderstood booking slot choices
+### 1. Voice transcription misunderstood booking slot choices
 
 Root cause: speech-to-text sometimes produced unclear slot/date phrases.
 
 Fix: stricter slot validation. After slots are shown, the user must choose a shown option or ask for more slots.
 
-### 3. Cancellation reason was mistaken as stopping the booking flow
+### 2. Cancellation reason was mistaken as stopping the booking flow
 
 Root cause: active booking router intercepted messages during cancellation stages.
 
