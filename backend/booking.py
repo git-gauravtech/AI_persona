@@ -7,6 +7,12 @@ Uses:
 - Groq as a meaning-extraction layer
 - Groq contact extraction for spoken emails
 - Backend state validation before any real booking/cancellation
+
+Voice improvements:
+- User-facing slot labels do not say "IST"
+- Slot labels are spoken naturally: Monday, June 8th at 5 PM
+- After slots are shown, unclear speech does not trigger random new slot fetching
+- User must choose one of shown options or ask for more slots
 """
 
 import os
@@ -37,9 +43,11 @@ CAL_BOOKINGS_API_VERSION = "2026-02-25"
 SLOT_DAYS_AHEAD = 14
 MAX_SLOTS_SHOWN = 3
 
-TIMEZONE_LABEL = "IST"
 TIMEZONE_NAME = "Asia/Kolkata"
 TIMEZONE_OFFSET = timedelta(hours=5, minutes=30)
+
+# Keep timezone internally for Cal.com, but do not speak "IST" to users.
+SHOW_TIMEZONE_IN_USER_MESSAGES = False
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -68,6 +76,7 @@ class BookingSession:
 
     guest_name: str = ""
     guest_email: str = ""
+    awaiting_email_confirmation: bool = False
 
     confirmed_booking_uid: str = ""
     confirmed_label: str = ""
@@ -92,6 +101,19 @@ def reset_session(session_id: str) -> BookingSession:
 
 def clear_session(session_id: str):
     sessions.pop(session_id, None)
+
+
+BOOKING_KEYWORDS = [
+    "book", "schedule", "interview", "call", "meeting",
+    "availability", "available", "slot", "calendar",
+    "set up a time", "connect", "appointment", "talk",
+    "reschedule", "cancel"
+]
+
+
+def is_booking_intent(message: str) -> bool:
+    msg = message.lower()
+    return any(keyword in msg for keyword in BOOKING_KEYWORDS)
 
 
 def is_in_booking_flow(session_id: str) -> bool:
@@ -120,6 +142,42 @@ def to_ist(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc) + TIMEZONE_OFFSET
+
+
+def ordinal_day(day: int) -> str:
+    if 10 <= day % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def format_slot_label(dt: datetime) -> str:
+    """
+    Human-friendly slot label for chat/voice.
+    Example: Monday, June 8th at 5 PM
+    """
+    ist_dt = to_ist(dt)
+
+    weekday = ist_dt.strftime("%A")
+    month = ist_dt.strftime("%B")
+    day = ordinal_day(ist_dt.day)
+
+    hour = ist_dt.strftime("%I").lstrip("0")
+    minute = ist_dt.strftime("%M")
+    ampm = ist_dt.strftime("%p")
+
+    if minute == "00":
+        time_text = f"{hour} {ampm}"
+    else:
+        time_text = f"{hour}:{minute} {ampm}"
+
+    label = f"{weekday}, {month} {day} at {time_text}"
+
+    if SHOW_TIMEZONE_IN_USER_MESSAGES:
+        label += " IST"
+
+    return label
 
 
 def parse_preference_from_text(preference_text: str) -> dict:
@@ -252,8 +310,7 @@ async def fetch_all_slots() -> list[dict]:
             continue
 
         start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-        ist_dt = to_ist(start_dt)
-        label = ist_dt.strftime("%A, %d %b · %I:%M %p") + f" {TIMEZONE_LABEL}"
+        label = format_slot_label(start_dt)
 
         slots.append({
             "start": start_iso,
@@ -382,8 +439,8 @@ Stage rules:
 - cancel_reason: treat message as cancellation reason unless user clearly refuses
 - cancel_confirming: yes/agree -> confirm_booking + confirmation true; no/refuse -> deny_or_change + confirmation false
 - awaiting_confirmation: yes -> confirm_booking + confirmation true; no/change -> deny_or_change + confirmation false
-- showing_slots: pick slot -> select_slot; other timings -> show_more_slots; new preference -> provide_preference
-- collecting_info: extract name/email -> provide_contact
+- showing_slots: choose a shown option -> select_slot. Ask for more -> show_more_slots. If unclear -> unknown.
+- collecting_info: extract name/email -> provide_contact. If confirming heard email -> confirm_booking.
 - asking_preference: treat as availability preference -> provide_preference
 - confirmed: cancel meeting -> cancel_confirmed_booking; new booking -> restart_flow
 
@@ -400,6 +457,7 @@ General:
         "chosen_slot": session.chosen_slot.get("label") if session.chosen_slot else None,
         "known_name": session.guest_name or None,
         "known_email": session.guest_email or None,
+        "awaiting_email_confirmation": session.awaiting_email_confirmation,
         "confirmed_booking": {
             "uid": session.confirmed_booking_uid or None,
             "label": session.confirmed_label or None,
@@ -499,10 +557,6 @@ def clean_reason(reason: str | None) -> str:
 
 
 def extract_contact_with_groq(user_message: str, known_name: str = "", known_email: str = "") -> dict:
-    """
-    Uses Groq to extract attendee name and email from typed or spoken text.
-    No manual spoken-email mapping is used here.
-    """
     system_prompt = """
 You extract contact details for a calendar booking.
 
@@ -605,6 +659,7 @@ def match_slot_by_reference(reference: str | None, pending_slots: list[dict]) ->
             f"{hour12}",
             f"{hour12} pm" if ist_dt.hour >= 12 else f"{hour12} am",
             f"{hour12}:{minute:02d}",
+            f"{hour12}:{minute:02d} pm" if ist_dt.hour >= 12 else f"{hour12}:{minute:02d} am",
         ]
 
         if any(p in ref for p in time_patterns):
@@ -627,13 +682,14 @@ def match_slot_by_reference(reference: str | None, pending_slots: list[dict]) ->
 # ── SLOT DISPLAY ──────────────────────────────────────────────────────────────
 
 def render_slots(slots: list[dict]) -> str:
-    lines = ["Here are the best matching available slots:"]
+    lines = ["I found these available slots:"]
 
     for i, slot in enumerate(slots, 1):
-        lines.append(f"{i}. {slot['label']}")
+        lines.append(f"Option {i}: {slot['label']}.")
 
     lines.append(
-        "Which one works for you? You can say the slot number, the time, or ask for other slots."
+        "Which option works for you? You can say option one, option two, option three, "
+        "or ask for other slots."
     )
 
     return "\n".join(lines)
@@ -690,9 +746,9 @@ async def show_slots_for_preference(session_id: str, preference_text: str) -> st
 
     try:
         all_slots = await fetch_all_slots()
-    except Exception as e:
+    except Exception:
         return (
-            f"I had trouble fetching Gaurav's calendar right now. "
+            "I had trouble fetching Gaurav's calendar right now. "
             f"You can also book directly at https://cal.com/{CAL_USERNAME}."
         )
 
@@ -704,7 +760,7 @@ async def show_slots_for_preference(session_id: str, preference_text: str) -> st
     ]
 
     if not filtered and prefs.get("strict_date"):
-        requested_date = prefs["dates"][0].strftime("%A, %d %b")
+        requested_date = prefs["dates"][0].strftime("%A, %B ") + ordinal_day(prefs["dates"][0].day)
         return (
             f"I don't see open slots on {requested_date}"
             f"{' ' + prefs['period'] if prefs.get('period') else ''}. "
@@ -731,17 +787,19 @@ async def handle_slot_selection(session_id: str, parsed: dict) -> str:
 
     if not selected:
         slots_list = "\n".join(
-            f"{i + 1}. {s['label']}"
+            f"Option {i + 1}: {s['label']}"
             for i, s in enumerate(session.pending_slots)
         )
 
         return (
-            "I couldn't identify which slot you meant. Please choose one of these:\n"
+            "I couldn't confidently match that to one of the available options. "
+            "Please say option one, option two, option three, or ask for other slots.\n"
             f"{slots_list}"
         )
 
     session.chosen_slot = selected
     session.stage = STAGE_COLLECTING_INFO
+    session.awaiting_email_confirmation = False
 
     return (
         f"Great, {session.chosen_slot['label']} works. "
@@ -752,6 +810,22 @@ async def handle_slot_selection(session_id: str, parsed: dict) -> str:
 
 async def handle_contact_collection(session_id: str, parsed: dict, user_message: str) -> str:
     session = get_session(session_id)
+
+    if session.awaiting_email_confirmation:
+        if parsed.get("confirmation") is True or parsed.get("intent") == "confirm_booking":
+            session.awaiting_email_confirmation = False
+            session.stage = STAGE_AWAITING_CONFIRMATION
+
+            return (
+                f"I'll book {session.chosen_slot['label']} for "
+                f"{session.guest_name} at {session.guest_email}. "
+                "Should I confirm this booking?"
+            )
+
+        if parsed.get("confirmation") is False or parsed.get("intent") == "deny_or_change":
+            session.guest_email = ""
+            session.awaiting_email_confirmation = False
+            return "Okay, please repeat the full email slowly."
 
     contact = extract_contact_with_groq(
         user_message=user_message,
@@ -782,15 +856,17 @@ async def handle_contact_collection(session_id: str, parsed: dict, user_message:
         )
 
     if contact.get("email_confidence") == "low":
+        session.awaiting_email_confirmation = True
         return (
             f"I heard the email as {session.guest_email}. "
             "Please confirm if that email is correct by saying yes, or repeat the email."
         )
 
+    session.awaiting_email_confirmation = False
     session.stage = STAGE_AWAITING_CONFIRMATION
 
     return (
-        f"I'll book **{session.chosen_slot['label']}** for "
+        f"I'll book {session.chosen_slot['label']} for "
         f"{session.guest_name} at {session.guest_email}. "
         "Should I confirm this booking?"
     )
@@ -823,13 +899,13 @@ async def confirm_booking_action(session_id: str) -> tuple[str, bool]:
 
         return (
             "All set! The interview is confirmed.\n\n"
-            f"Slot: **{session.confirmed_label}**\n"
+            f"Slot: {session.confirmed_label}\n"
             f"Name: {session.guest_name}\n"
             f"Confirmation ID: {booking_id}\n\n"
             f"A calendar invite has been sent to {session.guest_email}."
         ), False
 
-    except Exception as e:
+    except Exception:
         session.stage = STAGE_SHOWING_SLOTS
         return (
             "Something went wrong while booking. "
@@ -856,13 +932,13 @@ async def cancel_confirmed_booking_action(session_id: str) -> tuple[str, bool]:
         clear_session(session_id)
 
         return (
-            f"The booking for **{cancelled_label}** has been cancelled.\n"
+            f"The booking for {cancelled_label} has been cancelled.\n"
             f"Reason: {reason}"
         ), False
 
     except Exception:
         return (
-            f"I could not cancel automatically. "
+            "I could not cancel automatically. "
             f"Please manage it directly at https://cal.com/{CAL_USERNAME}."
         ), False
 
@@ -889,7 +965,7 @@ async def handle_booking(session_id: str, user_message: str) -> tuple[str, bool]
         session.stage = STAGE_CANCEL_CONFIRMING
 
         return (
-            f"Thanks. I'll cancel the confirmed booking for **{session.confirmed_label}** "
+            f"Thanks. I'll cancel the confirmed booking for {session.confirmed_label} "
             f"with reason: \"{session.cancellation_reason}\". Should I proceed?"
         ), True
 
@@ -902,7 +978,7 @@ async def handle_booking(session_id: str, user_message: str) -> tuple[str, bool]
             return "No problem. I have kept the booking as it is.", False
 
         return (
-            f"Please confirm whether I should cancel the booking for **{session.confirmed_label}**."
+            f"Please confirm whether I should cancel the booking for {session.confirmed_label}."
         ), True
 
     if session.stage == STAGE_AWAITING_CONFIRMATION:
@@ -937,7 +1013,7 @@ async def handle_booking(session_id: str, user_message: str) -> tuple[str, bool]
         if session.confirmed_booking_uid:
             session.stage = STAGE_CANCEL_REASON
             return (
-                f"I found a confirmed booking for **{session.confirmed_label}**. "
+                f"I found a confirmed booking for {session.confirmed_label}. "
                 "Could you share the reason for cancellation?"
             ), True
 
@@ -964,12 +1040,19 @@ async def handle_booking(session_id: str, user_message: str) -> tuple[str, bool]
             return reply, True
 
         if intent == "provide_preference":
-            preference_text = parsed.get("preference_text") or user_message
-            reply = await show_slots_for_preference(session_id, preference_text)
-            return reply, True
+            slots_list = "\n".join(
+                f"Option {i + 1}: {s['label']}"
+                for i, s in enumerate(session.pending_slots)
+            )
+
+            return (
+                "I couldn't confidently match that to one of the shown options. "
+                "Please choose one of these, or say show other slots:\n"
+                f"{slots_list}"
+            ), True
 
         return (
-            "Please choose one of the shown slots, ask for other options, or say a new preferred time."
+            "Please choose option one, option two, option three, or say show other slots."
         ), True
 
     if session.stage == STAGE_COLLECTING_INFO:
