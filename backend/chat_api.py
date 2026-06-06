@@ -24,7 +24,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from groq import Groq
 
 from retrieve import smart_retrieve, smart_retrieve_voice_context
 from booking import (
@@ -34,19 +33,18 @@ from booking import (
     get_session,
 )
 from intent import detect_intent
+from llm_client import call_groq_chat, call_groq_json
 
 load_dotenv()
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_ROUTER_MODEL = os.getenv("GROQ_ROUTER_MODEL", "llama-3.1-8b-instant")
 
 YOUR_NAME = "Gaurav Saklani"
 TARGET_ROLE = "AI Engineer Intern at Scaler"
 
-groq_client = Groq(api_key=GROQ_API_KEY)
 
 app = FastAPI(title="Gaurav AI Persona API")
 
@@ -196,14 +194,19 @@ def generate_groq_reply(
 
     messages.append({"role": "user", "content": message})
 
-    response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=messages,
-        temperature=0.2,
-        max_tokens=220 if is_voice else 512,
-    )
-
-    return response.choices[0].message.content.strip()
+    try:
+        return call_groq_chat(
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=180 if is_voice else 380,
+        )
+    except Exception as e:
+        print(f"[groq] final answer generation failed: {e}")
+        return (
+            "I’m having temporary trouble generating a full answer right now. "
+            "Please try again in a few minutes, or ask a shorter question."
+        )
 
 
 def confirm_end_call_intent(message: str) -> bool:
@@ -224,7 +227,7 @@ Rules:
     payload = {"user_message": message}
 
     try:
-        response = groq_client.chat.completions.create(
+        parsed = call_groq_json(
             model=GROQ_ROUTER_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -233,8 +236,6 @@ Rules:
             temperature=0,
             max_tokens=50,
         )
-
-        parsed = safe_json_loads(response.choices[0].message.content.strip())
         return bool(parsed.get("end_call", False))
 
     except Exception as e:
@@ -274,7 +275,7 @@ Important:
     }
 
     try:
-        response = groq_client.chat.completions.create(
+        parsed = call_groq_json(
             model=GROQ_ROUTER_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -283,8 +284,6 @@ Important:
             temperature=0,
             max_tokens=80,
         )
-
-        parsed = safe_json_loads(response.choices[0].message.content.strip())
         route = parsed.get("route", "unknown")
 
         if route in {

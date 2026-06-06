@@ -22,7 +22,7 @@ import httpx
 from datetime import datetime, timezone, timedelta, date
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
-from groq import Groq
+from llm_client import call_groq_json
 
 load_dotenv()
 
@@ -32,7 +32,6 @@ CAL_API_KEY = os.environ["CAL_API_KEY"]
 CAL_EVENT_TYPE_ID = os.environ["CAL_EVENT_TYPE_ID"]
 CAL_USERNAME = os.environ["CAL_USERNAME"]
 
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 CONTACT_EXTRACTION_MODEL = os.getenv("CONTACT_EXTRACTION_MODEL", "llama-3.1-8b-instant")
 
@@ -49,7 +48,6 @@ TIMEZONE_OFFSET = timedelta(hours=5, minutes=30)
 # Keep timezone internally for Cal.com, but do not speak "IST" to users.
 SHOW_TIMEZONE_IN_USER_MESSAGES = False
 
-groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ── STAGES ───────────────────────────────────────────────────────────────────
 
@@ -467,7 +465,7 @@ General:
     }
 
     try:
-        response = groq_client.chat.completions.create(
+        parsed = call_groq_json(
             model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -476,9 +474,6 @@ General:
             temperature=0,
             max_tokens=300,
         )
-
-        raw = response.choices[0].message.content.strip()
-        parsed = safe_json_loads(raw)
 
     except Exception as e:
         print(f"[booking] parse_booking_message failed: {e}")
@@ -586,7 +581,7 @@ Rules:
     }
 
     try:
-        response = groq_client.chat.completions.create(
+        parsed = call_groq_json(
             model=CONTACT_EXTRACTION_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -595,8 +590,6 @@ Rules:
             temperature=0,
             max_tokens=120,
         )
-
-        parsed = safe_json_loads(response.choices[0].message.content.strip())
 
     except Exception as e:
         print(f"[booking] contact extraction failed: {e}")

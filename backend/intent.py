@@ -13,13 +13,11 @@ Intents:
 """
 
 import os
-import json
-from groq import Groq
 from dotenv import load_dotenv
+from llm_client import call_groq_json
 
 load_dotenv()
 
-_groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 INTENT_MODEL = os.getenv("INTENT_MODEL", "llama-3.1-8b-instant")
 
 INTENT_SYSTEM_PROMPT = """
@@ -72,7 +70,7 @@ async def detect_intent(message: str) -> str:
     Classify user message intent using Groq.
     """
     try:
-        response = _groq_client.chat.completions.create(
+        parsed = call_groq_json(
             model=INTENT_MODEL,
             messages=[
                 {"role": "system", "content": INTENT_SYSTEM_PROMPT},
@@ -82,8 +80,6 @@ async def detect_intent(message: str) -> str:
             max_tokens=30,
         )
 
-        raw = response.choices[0].message.content.strip()
-        parsed = json.loads(raw)
         intent = parsed.get("intent", "general")
 
         valid = {
