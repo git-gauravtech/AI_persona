@@ -207,10 +207,6 @@ def generate_groq_reply(
 
 
 def confirm_end_call_intent(message: str) -> bool:
-    """
-    Double-check end-call intent using Groq.
-    This avoids mistakes like treating "listen" as goodbye.
-    """
     system_prompt = """
 You classify whether the user clearly wants to end the call.
 
@@ -247,15 +243,6 @@ Rules:
 
 
 def decide_active_booking_route(message: str, session_stage: str) -> str:
-    """
-    Decide what to do when a booking session is already active.
-
-    Returns:
-    - continue_booking
-    - pause_for_rag
-    - cancel_booking_flow
-    - unknown
-    """
     system_prompt = """
 You are a routing classifier for an AI assistant.
 
@@ -270,8 +257,8 @@ Return ONLY valid JSON:
 }
 
 Rules:
-- continue_booking: user gives date/time preference, selects a slot, gives name/email, confirms, asks for more slots, asks about the current booking, wants to cancel a confirmed meeting, or says anything likely related to scheduling.
-- pause_for_rag: user asks a normal question about Gaurav's background, projects, skills, education, achievements, resume, GitHub, role fit, or experience, and it is not part of the booking step.
+- continue_booking: user gives date/time preference, selects a slot, asks for more slots, asks about the current booking, wants to cancel a confirmed meeting, or says anything likely related to scheduling.
+- pause_for_rag: user asks a normal question about Gaurav's background, projects, skills, education, achievements, resume, GitHub, role fit, or experience, and it is not part of the current booking step.
 - cancel_booking_flow: user clearly wants to stop or abandon the current unconfirmed scheduling process.
 - unknown: unclear.
 
@@ -413,16 +400,27 @@ async def route_message(
     history: list[dict] | None = None,
     is_voice: bool = False
 ) -> tuple[str, bool, str]:
-    """
-    Central routing for all endpoints.
-    Returns: reply, booking_active, context_used
-    """
     print(f"[route] session={session_id} is_voice={is_voice} message={message!r}")
 
-    # Active booking flow gets first priority.
-    # This avoids mistakes where "listen" or noisy voice text breaks the booking flow.
     if is_in_booking_flow(session_id):
         session = get_session(session_id)
+
+        strict_booking_stages = {
+            "cancel_reason",
+            "cancel_confirming",
+            "collecting_info",
+            "awaiting_confirmation",
+        }
+
+        if session.stage in strict_booking_stages:
+            print(f"[route] strict_booking_stage={session.stage} → booking handler")
+            reply, still_active = await handle_booking(session_id, message)
+            reply = safe_reply(
+                reply,
+                "I had a moment of trouble with the booking. Could you repeat that?"
+            )
+            return reply, still_active, "booking_flow"
+
         active_route = decide_active_booking_route(message, session.stage)
         print(f"[route] active_booking_route={active_route}")
 
@@ -450,7 +448,6 @@ async def route_message(
         )
         return reply, still_active, "booking_flow"
 
-    # Only detect general intent when no booking session is active.
     intent = await detect_intent(message)
     print(f"[route] intent={intent}")
 
