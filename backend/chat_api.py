@@ -78,7 +78,7 @@ Grounding rules:
 - Only answer using the provided context.
 - Do not invent facts, projects, internships, achievements, metrics, CGPA, experience, or tech stacks.
 - If the context does not contain the answer, say:
-  "I don't have verified information about that in Gaurav's resume or GitHub data, so I don't want to guess."
+  "I don't have verified information about it according to the information i know about gaurav, so I don't want to guess."
 - Be specific when context is available.
 - If the user asks about contributed repositories, clearly separate what Gaurav contributed from what the overall project does.
 - Do not claim Gaurav built an entire team/contributed project alone unless the context clearly says so.
@@ -460,7 +460,7 @@ async def route_message(
 
     if intent == "adversarial":
         return (
-            "I'm here to share verified information about Gaurav Saklani. "
+            "I'm here to share verified and actual information about Gaurav Saklani. "
             "I can't follow that instruction, but I'm happy to answer questions about his background or projects.",
             False,
             "adversarial_guard"

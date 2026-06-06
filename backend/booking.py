@@ -729,7 +729,7 @@ def stage_1_ask_preference() -> str:
     return (
         "Sure, I can help schedule an interview with Gaurav. "
         "What day and time generally works best for you? "
-        "For example: Wednesday afternoon, tomorrow evening, or any morning this week."
+        "For example: Wednesday afternoon or any fit time for you"
     )
 
 
@@ -786,7 +786,7 @@ async def handle_slot_selection(session_id: str, parsed: dict) -> str:
 
         return (
             "I couldn't confidently match that to one of the available options. "
-            "Please say option one, option two, option three, or ask for other slots.\n"
+            "Please say like option one, option two, or ask for other slots.\n"
             f"{slots_list}"
         )
 
@@ -845,7 +845,7 @@ async def handle_contact_collection(session_id: str, parsed: dict, user_message:
         return (
             "I got the name, but I could not capture a valid email address clearly. "
             "Please repeat the full email slowly. "
-            f"If voice is difficult, you can also book directly at https://cal.com/{CAL_USERNAME}."
+            f"If voice is difficult."
         )
 
     if contact.get("email_confidence") == "low":
@@ -901,8 +901,8 @@ async def confirm_booking_action(session_id: str) -> tuple[str, bool]:
     except Exception:
         session.stage = STAGE_SHOWING_SLOTS
         return (
-            "Something went wrong while booking. "
-            f"You can try another slot or book directly at https://cal.com/{CAL_USERNAME}."
+            "Something went wrong while booking so either check your mail or "
+            f"You can try another slot."
         ), True
 
 
@@ -932,7 +932,7 @@ async def cancel_confirmed_booking_action(session_id: str) -> tuple[str, bool]:
     except Exception:
         return (
             "I could not cancel automatically. "
-            f"Please manage it directly at https://cal.com/{CAL_USERNAME}."
+            f"their is technical issue i think"
         ), False
 
 
@@ -1045,7 +1045,7 @@ async def handle_booking(session_id: str, user_message: str) -> tuple[str, bool]
             ), True
 
         return (
-            "Please choose option one, option two, option three, or say show other slots."
+            "Please choose option one, option two, or say show other slots."
         ), True
 
     if session.stage == STAGE_COLLECTING_INFO:
