@@ -428,7 +428,6 @@ async def vapi_direct(req: VapiChatCompletionRequest):
 async def root_chat_completions(req: VapiChatCompletionRequest):
     return await vapi_chat_completions(req)
 
-
 @app.get("/health")
 async def health():
     return {
@@ -438,11 +437,23 @@ async def health():
         "endpoints": {
             "chat": "/chat",
             "voice": "/voice",
-            "vapi_direct": "/vapi",
-            "vapi_openai": "/vapi/chat/completions",
-            "openai_compatible": "/chat/completions"
+            "vapi": "/vapi/chat/completions"
         }
     }
+
+
+@app.head("/health")
+async def health_head():
+    return {
+            "status": "ok",
+            "model": GROQ_MODEL,
+            "candidate": YOUR_NAME,
+            "endpoints": {
+                "chat": "/chat",
+                "voice": "/voice",
+                "vapi": "/vapi/chat/completions"
+            }
+        }
 
 
 @app.get("/")
