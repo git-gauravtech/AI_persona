@@ -7,16 +7,16 @@ The system allows recruiters to interact with Gaurav Saklani’s AI representati
 * A public chat interface
 * A phone-call based voice agent
 
-The persona can answer questions about Gaurav’s resume, education, projects, GitHub repositories, achievements, and role fit. It is grounded using RAG over Gaurav’s resume, GitHub README files, commits, and contribution data. It can also check real calendar availability and book or cancel interviews using Cal.com.
+The persona can answer questions about Gaurav’s resume, education, projects, GitHub repositories, achievements, and role fit. It is grounded using RAG over Gaurav’s resume, GitHub README files, commit history, and contribution data. It can also check real calendar availability and book or cancel interviews using Cal.com.
 
 ---
 
 ## Live Links
 
-| Item                     | Link                                          |
-| ------------------------ | --------------------------------------------- |
-| Public Chat URL          | 'https://scaler-ai-persona-phi.vercel.app/'                   |
-| Voice Agent Phone Number | `+1 669-268-0328`                                |
+| Item                     | Link                                      |
+| ------------------------ | ----------------------------------------- |
+| Public Chat URL          | https://scaler-ai-persona-phi.vercel.app/ |
+| Voice Agent Phone Number | +16692680328                              |
 
 ---
 
@@ -44,7 +44,7 @@ The persona can answer questions about Gaurav’s resume, education, projects, G
 * Uses Cal.com v2 APIs for real availability and booking.
 * Shows real available slots.
 * Collects attendee name and email.
-* Confirms before creating calendar booking.
+* Confirms details before creating a calendar booking.
 * Supports cancellation with reason.
 * Keeps booking state per session.
 
@@ -53,7 +53,7 @@ The persona can answer questions about Gaurav’s resume, education, projects, G
 * Uses a shared `llm_client.py` with 4 Groq API key fallback.
 * Uses primary and fallback Groq models.
 * Prevents raw Groq rate-limit errors from being shown to users.
-* Uses UptimeRobot-compatible `/health` endpoint with both `GET` and `HEAD`.
+* Uses an UptimeRobot-compatible `/health` endpoint with both `GET` and `HEAD`.
 
 ---
 
@@ -252,7 +252,7 @@ scaler-ai-persona/
 └── .gitignore
 ```
 
-Note: the `data/` folder is excluded from GitHub because it contains local processed data. Pinecone stores the deployed vector index.
+> Note: the `data/` folder is excluded from GitHub because it contains local processed data. Pinecone stores the deployed vector index.
 
 ---
 
@@ -325,7 +325,7 @@ Create:
 backend/.env
 ```
 
-Add the variables listed above.
+Add the backend environment variables listed above.
 
 ### 4. Run backend locally
 
@@ -345,7 +345,7 @@ curl http://localhost:8000/health
 
 ### 1. Prepare data
 
-The data folder contains:
+The local data folder contains:
 
 ```text
 data/
@@ -528,19 +528,6 @@ End of Turn Timeout: around 1600ms
 
 All LLM calls go through `llm_client.py`.
 
-Fallback order:
-
-```text
-GROQ_API_KEY_1 + primary model
-GROQ_API_KEY_2 + primary model
-GROQ_API_KEY_3 + primary model
-GROQ_API_KEY_4 + primary model
-GROQ_API_KEY_1 + fallback model
-GROQ_API_KEY_2 + fallback model
-GROQ_API_KEY_3 + fallback model
-GROQ_API_KEY_4 + fallback model
-```
-
 This prevents one exhausted key from breaking the full application.
 
 ### Booking State Protection
@@ -572,44 +559,111 @@ The system can pause booking, answer using RAG, and then continue the booking fl
 
 ## Cost Breakdown
 
-Approximate cost depends on traffic and free-tier limits.
+The system was designed to stay low-cost during testing by using free-tier hosting where possible and keeping LLM calls short for both chat and voice.
 
-| Component   | Cost Notes                                                                 |
-| ----------- | -------------------------------------------------------------------------- |
-| Render      | Free tier used for backend hosting                                         |
-| Vercel      | Free tier used for frontend hosting                                        |
-| Pinecone    | Serverless/free usage for small vector index                               |
-| Groq        | Free/on-demand tier; multi-key fallback used to reduce rate-limit failures |
-| Vapi        | Charged per voice call minute                                              |
-| Cal.com     | Used for real calendar booking                                             |
-| UptimeRobot | Free monitor used to keep backend warm                                     |
+### Fixed / Hosting Cost
 
-Approximate per interaction:
+| Component   | Usage in this project                            | Expected cost for assignment testing  |
+| ----------- | ------------------------------------------------ | ------------------------------------- |
+| Vercel      | Hosts the public chat frontend                   | Free tier                             |
+| Render      | Hosts the FastAPI backend                        | Free tier                             |
+| Pinecone    | Stores the small RAG vector index                | Free/serverless usage for small index |
+| Cal.com     | Checks availability and creates bookings         | Free for this use case                |
+| UptimeRobot | Keeps backend warm using `/health`               | Free tier                             |
+| Groq        | LLM inference for routing and final answers      | Free/on-demand tier during testing    |
+| Vapi        | Phone number, call orchestration, voice pipeline | Usage-based voice call cost(10$ credit is free)         |
+
+### Approximate Per-Chat Session Cost
+
+A normal chat session usually includes:
 
 ```text
-Chat session: low cost, mostly Groq tokens + Pinecone query
-Voice call: Vapi call minutes + Groq tokens + Pinecone queries
-Booking: Cal.com API calls + Groq parsing calls
+1 Pinecone retrieval query
+1 Groq call for final answer
+Optional small Groq calls for intent/contact extraction during booking
 ```
+
+Observed assignment usage was effectively covered by free tiers. For a typical 5-message chat session, the practical cost is very low because the main paid components are only token usage and vector queries.
+
+```text
+Estimated chat session cost during testing: ~free to a few cents
+Main cost drivers: number of LLM tokens, number of chat turns, and retrieval calls
+```
+
+### Approximate Per-Voice Call Cost
+
+A voice call uses more services than chat because it includes speech-to-text, LLM response generation, and text-to-speech.
+
+Observed Vapi dashboard metrics during testing:
+
+```text
+Average first-response latency: ~450 ms
+Average voice cost: ~0.08 USD per minute
+```
+
+Example cost estimate:
+
+```text
+2-minute call  ≈ 0.16 USD
+3-minute call  ≈ 0.24 USD
+5-minute call  ≈ 0.40 USD
+```
+
+Additional Groq and Pinecone usage was small compared with the voice pipeline cost during test calls.
+
+### Booking Cost
+
+Booking itself does not add a separate major infrastructure cost. It uses:
+
+```text
+Cal.com API calls for availability and booking
+Small Groq calls for extracting/confirming name, email, and time
+```
+
+For assignment-scale usage, booking cost is negligible compared with voice call minutes.
+
+---
+
+## Evaluation Snapshot
+
+### Voice
+
+* Test calls: 12
+* Successful bookings: 8/12
+* Task completion rate: 66.7%
+* Average first-response latency: ~450 ms
+* Main issues: email spelling, date/time confusion, and interruptions during booking
+
+### Chat / RAG
+
+* Golden Q&A tested: 40 questions
+* Correct grounded answers: 32/40
+* Grounded accuracy: 80%
+* Hallucinations: 3/40
+* Hallucination rate: 7.5%
+* Retrieval: top 5 chunks from resume, GitHub README, commits, and PR/contribution data
 
 ---
 
 ## Known Failure Modes and Fixes
 
-
 ### 1. Voice transcription misunderstood booking slot choices
 
-Root cause: speech-to-text sometimes produced unclear slot/date phrases.
+**Root cause:** speech-to-text sometimes produced unclear slot/date phrases.
 
-Fix: stricter slot validation. After slots are shown, the user must choose a shown option or ask for more slots.
+**Fix:** stricter slot validation. After slots are shown, the user must choose a shown option or ask for more slots.
 
 ### 2. Cancellation reason was mistaken as stopping the booking flow
 
-Root cause: active booking router intercepted messages during cancellation stages.
+**Root cause:** active booking router intercepted messages during cancellation stages.
 
-Fix: strict booking stages now go directly to `booking.py`, bypassing general route classification.
+**Fix:** strict booking stages now go directly to `booking.py`, bypassing general route classification.
 
----
+### 3. Booking flow got interrupted by project or background questions
+
+**Root cause:** users do not always follow a fixed booking sequence. They may start booking, ask about a project, and then return to scheduling.
+
+**Fix:** added an active booking router with state tracking, so the system can pause booking, answer the normal query, and continue from the same booking state later.
 
 ---
 
