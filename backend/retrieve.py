@@ -13,8 +13,8 @@ NAMESPACE = "gaurav-ai-persona"
 
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
-TOP_K_CHAT = 6
-TOP_K_VOICE = 3
+TOP_K_CHAT = 7
+TOP_K_VOICE = 5
 
 print(f"Loading FastEmbed retrieval model: {EMBEDDING_MODEL}")
 embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL)
@@ -24,19 +24,19 @@ index = pc.Index(INDEX_NAME)
 
 
 # ── PROJECT / REPO ALIASES ────────────────────────────────────────────────────
-# These source names must match metadata["source"] in Pinecone.
-# This is routing logic only, not answer hardcoding.
 
 REPO_ALIASES = {
     "vocalis-ai": [
         "vocalis",
         "vocalis-ai",
+        "vocalis ai",
         "intelligent ai interview",
         "interview simulation",
         "mock interview",
         "ai interview",
         "voice interview",
         "resume based interview",
+        "behavioral analysis",
     ],
     "flask-ml-app": [
         "flask-ml-app",
@@ -47,6 +47,7 @@ REPO_ALIASES = {
         "vehicle ml",
         "voting classifier",
         "maintenance prediction",
+        "ensemble learning",
     ],
     "QuestForge": [
         "questforge",
@@ -67,6 +68,7 @@ REPO_ALIASES = {
         "leaf health",
         "mobilenet",
         "grad-cam",
+        "grad cam",
         "plant disease",
         "streamlit plant",
     ],
@@ -97,12 +99,10 @@ REPO_ALIASES = {
 
 
 def normalize_text(text: str) -> str:
-    """Lowercase and normalize whitespace."""
     return re.sub(r"\s+", " ", text.lower()).strip()
 
 
 def detect_repo(query: str) -> str | None:
-    """Detect if the query refers to a known project/repo."""
     q = normalize_text(query)
 
     for source, aliases in REPO_ALIASES.items():
@@ -114,7 +114,6 @@ def detect_repo(query: str) -> str | None:
 
 
 def embed_query(query: str) -> list[float]:
-    """Embed a single query using FastEmbed."""
     embedding = next(embedding_model.embed([query]))
 
     if hasattr(embedding, "tolist"):
@@ -122,14 +121,12 @@ def embed_query(query: str) -> list[float]:
 
     return list(embedding)
 
+
 def retrieve(
     query: str,
     top_k: int = TOP_K_CHAT,
     metadata_filter: dict | None = None
 ) -> list[dict]:
-    """
-    Retrieve relevant chunks from Pinecone.
-    """
     query_embedding = embed_query(query)
 
     query_params = {
@@ -168,7 +165,6 @@ def retrieve(
 
 
 def dedupe_chunks(chunks: list[dict]) -> list[dict]:
-    """Remove duplicate chunks by source/type/text prefix."""
     seen = set()
     unique = []
 
@@ -176,7 +172,7 @@ def dedupe_chunks(chunks: list[dict]) -> list[dict]:
         key = (
             chunk.get("source", ""),
             chunk.get("type", ""),
-            chunk.get("text", "")[:250]
+            chunk.get("text", "")[:250],
         )
 
         if key not in seen:
@@ -187,9 +183,6 @@ def dedupe_chunks(chunks: list[dict]) -> list[dict]:
 
 
 def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
-    """
-    Light reranking to improve broad project answers.
-    """
     query_lower = normalize_text(query)
 
     broad_question = any(
@@ -216,6 +209,75 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
             "worked on",
             "built",
             "responsibility",
+        ]
+    )
+
+    education_question = any(
+        phrase in query_lower
+        for phrase in [
+            "education",
+            "currently doing",
+            "current status",
+            "currently pursuing",
+            "pursuing",
+            "studying",
+            "student",
+            "college",
+            "university",
+            "btech",
+            "b.tech",
+            "degree",
+            "specialization",
+            "cgpa",
+            "12th",
+            "class 12",
+            "intermediate",
+            "10th",
+            "class 10",
+            "high school",
+            "schooling",
+        ]
+    )
+
+    achievement_question = any(
+        phrase in query_lower
+        for phrase in [
+            "achievement",
+            "achievements",
+            "award",
+            "awards",
+            "honours",
+            "honors",
+            "amazon ml",
+            "microsoft sefa",
+            "leetcode",
+            "hackathon",
+            "patent",
+            "publication",
+            "research paper",
+            "paper",
+            "conference",
+        ]
+    )
+
+    fit_question = any(
+        phrase in query_lower
+        for phrase in [
+            "fit",
+            "good fit",
+            "why hire",
+            "why should",
+            "right fit",
+            "suitable",
+            "strength",
+            "strengths",
+            "expectation",
+            "expectations",
+            "from us",
+            "role",
+            "internship",
+            "ai engineer",
+            "scaler",
         ]
     )
 
@@ -246,7 +308,6 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
             "prompt",
             "fine tuning",
             "fine-tuning",
-            "gemini",
             "groq",
             "ml",
             "machine learning",
@@ -260,54 +321,122 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
         text = chunk.get("text", "").lower()
         score = float(chunk.get("score", 0))
 
-        # Strong section boosts
-        if "overview" in text:
-            score += 0.25
-        if "my role" in text:
+        if chunk.get("on_resume"):
+            score += 0.05
+
+        # Strong resume/background boosts
+        if "quick verified facts" in text:
             score += 0.35
+        if "current education and status" in text:
+            score += 0.35
+        if "frequently asked verified answers" in text:
+            score += 0.30
+        if "education" in text:
+            score += 0.18
+        if "graphic era hill university" in text:
+            score += 0.25
+        if "b.tech" in text or "btech" in text:
+            score += 0.25
+        if "cgpa" in text:
+            score += 0.20
+        if "class 12" in text or "intermediate" in text:
+            score += 0.18
+        if "class 10" in text or "high school" in text:
+            score += 0.18
+        if "amazon ml summer school" in text:
+            score += 0.18
+        if "microsoft sefa" in text:
+            score += 0.14
+        if "patent" in text:
+            score += 0.16
+        if "publication" in text or "research paper" in text:
+            score += 0.16
+        if "expectations from internship" in text:
+            score += 0.15
+        if "what makes gaurav a good fit" in text:
+            score += 0.25
+
+        # Project section boosts
+        if "overview" in text:
+            score += 0.18
+        if "my role" in text or "gaurav's role" in text:
+            score += 0.25
         if "gaurav's contribution" in text:
-            score += 0.30
+            score += 0.25
         if "contribution scope" in text:
-            score += 0.30
-        if "problem it solves" in text:
-            score += 0.08
+            score += 0.25
         if "technical stack" in text or "tech stack" in text:
-            score += 0.07
+            score += 0.06
         if "architecture" in text:
-            score += 0.08
+            score += 0.06
         if "ai integration" in text:
             score += 0.08
-        if "backend work" in text:
-            score += 0.08
-        if "design decisions" in text:
+        if "backend" in text:
             score += 0.05
-        if "challenges" in text:
-            score += 0.04
-        if "tradeoffs" in text or "trade-offs" in text:
-            score += 0.04
-        if "what i would improve" in text or "what gaurav would improve" in text:
-            score += 0.04
 
-        # Query-specific boosts
         if broad_question:
+            if "summary" in text:
+                score += 0.12
             if "overview" in text:
-                score += 0.25
-            if "my role" in text:
-                score += 0.25
-            if "problem it solves" in text:
-                score += 0.08
+                score += 0.16
+            if "what makes gaurav a good fit" in text:
+                score += 0.18
 
         if role_question:
-            if "my role" in text:
+            if "role" in text:
+                score += 0.20
+            if "contribution" in text:
+                score += 0.20
+            if "team project" in text:
+                score += 0.10
+
+        if education_question:
+            if "education" in text:
+                score += 0.35
+            if "current education and status" in text:
+                score += 0.40
+            if "graphic era hill university" in text:
+                score += 0.35
+            if "b.tech" in text or "btech" in text:
+                score += 0.30
+            if "cgpa" in text:
+                score += 0.22
+            if "class 12" in text or "intermediate" in text:
+                score += 0.20
+            if "class 10" in text or "high school" in text:
+                score += 0.20
+
+        if achievement_question:
+            if "achievements" in text:
+                score += 0.55
+            if "amazon ml summer school" in text:
+                score += 0.30
+            if "microsoft sefa" in text:
+                score += 0.20
+            if "patent" in text:
                 score += 0.25
-            if "contribution scope" in text:
+            if "publication" in text:
+                score += 0.25
+            if "leetcode" in text:
+                score += 0.18
+            if "hackathon" in text:
+                score += 0.30
+
+        if fit_question:
+            if "what makes gaurav a good fit" in text:
+                score += 0.35
+            if "expectations from internship" in text:
                 score += 0.22
-            if "gaurav's contribution" in text:
-                score += 0.22
-            if "backend" in text:
-                score += 0.05
-            if "ai integration" in text:
-                score += 0.05
+            if "ai engineer intern" in text:
+                score += 0.20
+            if "scaler" in text:
+                score += 0.12
+            if "production-ready ai applications" in text:
+                score += 0.12
+            if "rag" in text:
+                score += 0.08
+            if "voice agents" in text:
+                score += 0.08
 
         if architecture_question:
             if "architecture" in text:
@@ -339,7 +468,6 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
             if "tensorflow" in text or "keras" in text:
                 score += 0.05
 
-        # Prefer README and PR/contribution notes over noisy commit batches.
         if chunk.get("type") == "readme_section":
             score += 0.03
         if chunk.get("type") == "pull_request":
@@ -353,9 +481,6 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
 
 
 def format_context(chunks: list[dict]) -> str:
-    """
-    Format retrieved chunks into context for LLM.
-    """
     if not chunks:
         return "No relevant context found."
 
@@ -394,19 +519,10 @@ def format_context(chunks: list[dict]) -> str:
 
 
 def smart_retrieve_chunks(query: str, top_k: int = TOP_K_CHAT) -> list[dict]:
-    """
-    Smart metadata-aware retrieval.
-
-    Priority:
-    1. Specific repo/project mentioned
-    2. Contribution/team project questions
-    3. Resume/background/fit questions
-    4. General search
-    """
     query_lower = normalize_text(query)
 
-    # 1. Repo-specific routing
     detected_repo = detect_repo(query)
+
     if detected_repo:
         expanded_query = (
             f"{query} overview my role Gaurav contribution contribution scope "
@@ -425,7 +541,6 @@ def smart_retrieve_chunks(query: str, top_k: int = TOP_K_CHAT) -> list[dict]:
             chunks = rerank_chunks(query, chunks)
             return chunks[:top_k]
 
-    # 2. Contributed project routing
     contributed_keywords = [
         "contributed",
         "contribution",
@@ -456,7 +571,6 @@ def smart_retrieve_chunks(query: str, top_k: int = TOP_K_CHAT) -> list[dict]:
             chunks = rerank_chunks(query, chunks)
             return chunks[:top_k]
 
-    # 3. Resume / background / fit routing
     resume_keywords = [
         "experience",
         "background",
@@ -471,6 +585,7 @@ def smart_retrieve_chunks(query: str, top_k: int = TOP_K_CHAT) -> list[dict]:
         "why should",
         "hire",
         "right person",
+        "good fit",
         "ai engineer",
         "scaler",
         "projects in resume",
@@ -481,17 +596,55 @@ def smart_retrieve_chunks(query: str, top_k: int = TOP_K_CHAT) -> list[dict]:
         "college",
         "university",
         "technical skills",
+        "currently doing",
+        "current status",
+        "currently pursuing",
+        "pursuing",
+        "studying",
+        "student",
+        "btech",
+        "b.tech",
+        "specialization",
+        "12th",
+        "class 12",
+        "intermediate",
+        "10th",
+        "class 10",
+        "high school",
+        "schooling",
+        "achievements",
+        "achievement",
+        "awards",
+        "honours",
+        "honors",
+        "amazon ml summer school",
+        "microsoft sefa",
+        "patent",
+        "publication",
+        "research paper",
+        "leetcode",
+        "hackathon",
+        "expectation",
+        "expectations",
+        "from us",
+        "internship expectation",
+        "salary expectation",
+        "stipend",
     ]
 
     if any(keyword in query_lower for keyword in resume_keywords):
         expanded_query = (
-            f"{query} resume education skills projects achievements "
-            f"AI engineer intern fit backend AI integration machine learning RAG"
+            f"{query} quick verified facts current education and status "
+            f"B.Tech Computer Science Engineering AI ML specialization Graphic Era Hill University "
+            f"CGPA 9.10 Class 12 Intermediate 90.8 Class 10 High School 95.2 "
+            f"skills achievements Amazon ML Summer School Microsoft SEFA patent publication "
+            f"LeetCode 400 questions rating 1530 AI Engineer Intern Scaler fit expectations internship "
+            f"RAG LLM prompt engineering backend AI integration voice agents"
         )
 
         chunks = retrieve(
             query=expanded_query,
-            top_k=max(top_k, 10),
+            top_k=max(top_k, 12),
             metadata_filter={"on_resume": True}
         )
 
@@ -500,10 +653,9 @@ def smart_retrieve_chunks(query: str, top_k: int = TOP_K_CHAT) -> list[dict]:
             chunks = rerank_chunks(query, chunks)
             return chunks[:top_k]
 
-    # 4. General search across everything
     chunks = retrieve(query=query, top_k=top_k)
     chunks = dedupe_chunks(chunks)
-    return rerank_chunks(query, chunks)
+    return rerank_chunks(query, chunks)[:top_k]
 
 
 def smart_retrieve_context(query: str, top_k: int = TOP_K_CHAT) -> str:
@@ -511,26 +663,19 @@ def smart_retrieve_context(query: str, top_k: int = TOP_K_CHAT) -> str:
     return format_context(chunks)
 
 
-# Backward-compatible alias for chat_api.py
 def smart_retrieve(query: str) -> str:
     return smart_retrieve_context(query)
 
 
 def smart_retrieve_voice_context(query: str) -> str:
-    """
-    Smaller context for voice agent.
-    Use fewer chunks to reduce latency and keep spoken answers short.
-    """
     chunks = smart_retrieve_chunks(query=query, top_k=TOP_K_VOICE)
     return format_context(chunks)
 
 
-# ── CLI TEST ──────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     import sys
 
-    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "Tell me about Gaurav's AI projects"
+    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "Tell me about Gaurav's education"
 
     print(f"\nQuery: {query}")
     print("=" * 80)
