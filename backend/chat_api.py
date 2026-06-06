@@ -3,7 +3,7 @@ chat_api.py
 Chat + Voice + Vapi API for Gaurav AI Persona.
 
 Handles:
-1. Booking flow
+1. Booking flow (via booking.py)
 2. RAG-grounded chat answers using Groq
 3. Short voice endpoint
 4. Vapi Custom LLM compatible endpoint
@@ -20,7 +20,8 @@ from pydantic import BaseModel, Field
 from groq import Groq
 
 from retrieve import smart_retrieve, smart_retrieve_voice_context
-from booking import is_booking_intent, is_in_booking_flow, handle_booking
+from booking import is_in_booking_flow, handle_booking
+from intent import detect_intent
 
 load_dotenv()
 
@@ -38,7 +39,7 @@ app = FastAPI(title="Gaurav AI Persona API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Later restrict to your frontend URL
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -87,7 +88,7 @@ Booking:
 """.strip()
 
 
-# ── NORMAL CHAT MODELS ────────────────────────────────────────────────────────
+# ── MODELS ────────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     message: str
@@ -101,8 +102,6 @@ class ChatResponse(BaseModel):
     booking_active: bool = False
 
 
-# ── VOICE MODELS ──────────────────────────────────────────────────────────────
-
 class VoiceRequest(BaseModel):
     message: str
     session_id: str = "voice-default"
@@ -112,8 +111,6 @@ class VoiceResponse(BaseModel):
     reply: str
     booking_active: bool = False
 
-
-# ── VAPI CUSTOM LLM MODELS ────────────────────────────────────────────────────
 
 class VapiChatCompletionRequest(BaseModel):
     model: str | None = None
@@ -152,31 +149,18 @@ def generate_groq_reply(
     is_voice: bool = False
 ) -> str:
     messages = [
-        {
-            "role": "system",
-            "content": build_system_prompt(is_voice=is_voice)
-        },
-        {
-            "role": "system",
-            "content": f"Relevant verified context about {YOUR_NAME}:\n\n{context}"
-        }
+        {"role": "system", "content": build_system_prompt(is_voice=is_voice)},
+        {"role": "system", "content": f"Relevant verified context about {YOUR_NAME}:\n\n{context}"}
     ]
 
     if history and not is_voice:
         for turn in history[-10:]:
             role = turn.get("role")
             content = turn.get("content")
-
             if role in ("user", "assistant") and content:
-                messages.append({
-                    "role": role,
-                    "content": content
-                })
+                messages.append({"role": role, "content": content})
 
-    messages.append({
-        "role": "user",
-        "content": message
-    })
+    messages.append({"role": "user", "content": message})
 
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
@@ -189,80 +173,115 @@ def generate_groq_reply(
 
 
 def extract_latest_user_message(messages: list[dict]) -> str:
-    """
-    Extract latest user message from OpenAI/Vapi-style messages.
-    Supports both string content and list content.
-    """
     for message in reversed(messages):
         if message.get("role") != "user":
             continue
-
         content = message.get("content", "")
-
         if isinstance(content, str):
             return content.strip()
-
         if isinstance(content, list):
             parts = []
-
             for item in content:
                 if isinstance(item, dict):
                     if item.get("type") == "text":
                         parts.append(item.get("text", ""))
                     elif "text" in item:
                         parts.append(str(item.get("text", "")))
-
             return " ".join(parts).strip()
-
     return ""
 
 
 def extract_vapi_session_id(req: VapiChatCompletionRequest) -> str:
-    """
-    Use Vapi call ID when available so one phone call keeps booking state.
-    """
     if req.call:
-        call_id = (
-            req.call.get("id")
-            or req.call.get("callId")
-            or req.call.get("sid")
-        )
-
+        call_id = req.call.get("id") or req.call.get("callId") or req.call.get("sid")
         if call_id:
             return f"vapi-{call_id}"
-
     if req.metadata:
         session_id = (
             req.metadata.get("session_id")
             or req.metadata.get("sessionId")
             or req.metadata.get("call_id")
         )
-
         if session_id:
             return f"vapi-{session_id}"
-
     return "vapi-default-session"
 
 
-async def run_voice_logic(message: str, session_id: str) -> tuple[str, bool]:
-    """
-    Shared voice logic used by /voice and /vapi/chat/completions.
-    Booking has priority. Otherwise uses voice RAG.
-    """
-    if is_in_booking_flow(session_id) or is_booking_intent(message):
-        reply, still_active = await handle_booking(session_id, message)
-        return reply, still_active
+def safe_reply(reply: str, fallback: str) -> str:
+    """Never return empty string to Vapi or chat."""
+    if reply and reply.strip():
+        return reply.strip()
+    print(f"[warn] Empty reply detected, using fallback")
+    return fallback
 
-    context = smart_retrieve_voice_context(message)
+
+# ── CORE ROUTING LOGIC ────────────────────────────────────────────────────────
+
+async def route_message(
+    message: str,
+    session_id: str,
+    history: list[dict] | None = None,
+    is_voice: bool = False
+) -> tuple[str, bool, str]:
+    """
+    Central routing for all endpoints.
+    Returns: (reply, booking_active, context_used)
+    """
+    print(f"[route] session={session_id} is_voice={is_voice} message={message!r}")
+
+    # Active booking session always takes priority — no intent check needed
+    if is_in_booking_flow(session_id):
+        print(f"[route] active booking session → booking handler")
+        reply, still_active = await handle_booking(session_id, message)
+        reply = safe_reply(reply, "I had a moment of trouble with the booking. Could you repeat that?")
+        return reply, still_active, "booking_flow"
+
+    # Detect intent via Groq
+    intent = await detect_intent(message)
+    print(f"[route] intent={intent}")
+
+    if intent == "booking":
+        reply, still_active = await handle_booking(session_id, message)
+        reply = safe_reply(reply, "I'd love to help schedule an interview. What day works best for you?")
+        return reply, still_active, "booking_flow"
+
+    if intent == "adversarial":
+        return (
+            "I'm here to share verified information about Gaurav Saklani. "
+            "I can't follow that instruction, but I'm happy to answer questions about his background or projects.",
+            False,
+            "adversarial_guard"
+        )
+
+    if intent == "off_topic":
+        return (
+            "I'm Gaurav's AI representative, so I'm best equipped to answer questions about "
+            "his background, projects, or to help schedule an interview. "
+            "Is there something specific about Gaurav I can help with?",
+            False,
+            "off_topic_guard"
+        )
+
+    # background / project / general → RAG + Groq
+    context = (
+        smart_retrieve_voice_context(message)
+        if is_voice
+        else smart_retrieve(message)
+    )
 
     reply = generate_groq_reply(
         message=message,
         context=context,
-        history=None,
-        is_voice=True
+        history=history,
+        is_voice=is_voice
     )
 
-    return reply, False
+    reply = safe_reply(
+        reply,
+        "I'm having trouble accessing Gaurav's information right now. Please try again."
+    )
+
+    return reply, False, context
 
 
 # ── ROUTES ───────────────────────────────────────────────────────────────────
@@ -270,98 +289,58 @@ async def run_voice_logic(message: str, session_id: str) -> tuple[str, bool]:
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     message = req.message.strip()
-    session_id = req.session_id
-
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    # ── Booking flow takes priority ───────────────────────────────────────────
-    if is_in_booking_flow(session_id) or is_booking_intent(message):
-        try:
-            reply, still_active = await handle_booking(session_id, message)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Booking error: {str(e)}")
-
-        return ChatResponse(
-            reply=reply,
-            context_used="booking_flow",
-            booking_active=still_active
-        )
-
-    # ── RAG retrieval ─────────────────────────────────────────────────────────
     try:
-        context = smart_retrieve(message)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Retrieval error: {str(e)}")
-
-    # ── Groq response ─────────────────────────────────────────────────────────
-    try:
-        reply = generate_groq_reply(
+        reply, booking_active, context_used = await route_message(
             message=message,
-            context=context,
+            session_id=req.session_id,
             history=req.history,
             is_voice=False
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Groq error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return ChatResponse(
-        reply=reply,
-        context_used=context,
-        booking_active=False
-    )
+    return ChatResponse(reply=reply, context_used=context_used, booking_active=booking_active)
 
 
 @app.post("/voice", response_model=VoiceResponse)
 async def voice(req: VoiceRequest):
-    """
-    Simple voice endpoint.
-    Useful for local testing and non-Vapi voice integrations.
-    """
     message = req.message.strip()
-    session_id = req.session_id
-
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
     try:
-        reply, booking_active = await run_voice_logic(
+        reply, booking_active, _ = await route_message(
             message=message,
-            session_id=session_id
+            session_id=req.session_id,
+            is_voice=True
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Voice error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return VoiceResponse(
-        reply=reply,
-        booking_active=booking_active
-    )
+    return VoiceResponse(reply=reply, booking_active=booking_active)
 
 
 @app.post("/vapi/chat/completions", response_model=VapiChatCompletionResponse)
 async def vapi_chat_completions(req: VapiChatCompletionRequest):
-    """
-    Vapi Custom LLM endpoint.
-
-    Vapi sends OpenAI-style messages.
-    This endpoint extracts the latest user message, routes through the same
-    voice RAG + booking logic, and returns an OpenAI-compatible response.
-    """
     latest_message = extract_latest_user_message(req.messages)
-
     if not latest_message:
         latest_message = "Hello"
 
     session_id = extract_vapi_session_id(req)
 
     try:
-        reply, _ = await run_voice_logic(
+        reply, _, _ = await route_message(
             message=latest_message,
-            session_id=session_id
+            session_id=session_id,
+            is_voice=True
         )
-    except Exception:
+    except Exception as e:
+        print(f"[vapi] route_message failed: {e}")
         reply = (
-            "I had trouble accessing Gaurav's verified information or booking system right now. "
+            "I had trouble accessing Gaurav's information right now. "
             "Please try again in a moment."
         )
 
@@ -372,10 +351,7 @@ async def vapi_chat_completions(req: VapiChatCompletionRequest):
         choices=[
             VapiChoice(
                 index=0,
-                message=VapiChoiceMessage(
-                    role="assistant",
-                    content=reply
-                ),
+                message=VapiChoiceMessage(role="assistant", content=reply),
                 finish_reason="stop"
             )
         ]
