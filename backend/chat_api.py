@@ -3,10 +3,10 @@ chat_api.py
 Chat + Voice + Vapi API for Gaurav AI Persona.
 
 Handles:
-1. Booking flow (via booking.py)
+1. Booking flow via booking.py
 2. RAG-grounded chat answers using Groq
 3. Short voice endpoint
-4. Vapi Custom LLM compatible endpoint (streaming + non-streaming)
+4. Vapi Custom LLM compatible endpoint
 """
 
 import os
@@ -28,12 +28,12 @@ from intent import detect_intent
 load_dotenv()
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
+
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 YOUR_NAME = "Gaurav Saklani"
 TARGET_ROLE = "AI Engineer Intern at Scaler"
-# ─────────────────────────────────────────────────────────────────────────────
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -60,7 +60,7 @@ def build_system_prompt(is_voice: bool = False) -> str:
 You are {YOUR_NAME}'s AI representative for the {TARGET_ROLE} screening assignment.
 
 Your job:
-- Answer questions about {YOUR_NAME}'s resume, projects, GitHub repositories, skills, background, and fit for the role.
+- Answer questions about {YOUR_NAME}'s resume, projects, GitHub repositories, skills, background, education, achievements, and fit for the role.
 - Speak as an AI representative, not as the human candidate.
 - Use natural wording like "Gaurav built...", "Gaurav worked on...", "His role involved...", or "His contribution included...".
 - Do not pretend to be the human Gaurav.
@@ -70,7 +70,7 @@ Grounding rules:
 - Do not invent facts, projects, internships, achievements, metrics, CGPA, experience, or tech stacks.
 - If the context does not contain the answer, say:
   "I don't have verified information about that in Gaurav's resume or GitHub data, so I don't want to guess."
-- Be specific and evidence-backed when context is available.
+- Be specific when context is available.
 - If the user asks about contributed repositories, clearly separate what Gaurav contributed from what the overall project does.
 - Do not claim Gaurav built an entire team/contributed project alone unless the context clearly says so.
 
@@ -90,7 +90,7 @@ Booking:
 """.strip()
 
 
-# ── MODELS ────────────────────────────────────────────────────────────────────
+# ── MODELS ───────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     message: str
@@ -152,7 +152,10 @@ def generate_groq_reply(
 ) -> str:
     messages = [
         {"role": "system", "content": build_system_prompt(is_voice=is_voice)},
-        {"role": "system", "content": f"Relevant verified context about {YOUR_NAME}:\n\n{context}"}
+        {
+            "role": "system",
+            "content": f"Relevant verified context about {YOUR_NAME}:\n\n{context}"
+        }
     ]
 
     if history and not is_voice:
@@ -178,9 +181,12 @@ def extract_latest_user_message(messages: list[dict]) -> str:
     for message in reversed(messages):
         if message.get("role") != "user":
             continue
+
         content = message.get("content", "")
+
         if isinstance(content, str):
             return content.strip()
+
         if isinstance(content, list):
             parts = []
             for item in content:
@@ -190,6 +196,7 @@ def extract_latest_user_message(messages: list[dict]) -> str:
                     elif "text" in item:
                         parts.append(str(item.get("text", "")))
             return " ".join(parts).strip()
+
     return ""
 
 
@@ -198,6 +205,7 @@ def extract_vapi_session_id(req: VapiChatCompletionRequest) -> str:
         call_id = req.call.get("id") or req.call.get("callId") or req.call.get("sid")
         if call_id:
             return f"vapi-{call_id}"
+
     if req.metadata:
         session_id = (
             req.metadata.get("session_id")
@@ -206,33 +214,37 @@ def extract_vapi_session_id(req: VapiChatCompletionRequest) -> str:
         )
         if session_id:
             return f"vapi-{session_id}"
+
     return "vapi-default-session"
 
 
 def safe_reply(reply: str, fallback: str) -> str:
     if reply and reply.strip():
         return reply.strip()
-    print(f"[warn] Empty reply detected, using fallback")
+
+    print("[warn] Empty reply detected, using fallback")
     return fallback
 
 
 def make_sse_chunk(reply: str, model: str, finish: bool = False) -> str:
-    """Build a single SSE chunk in OpenAI streaming format."""
     chunk = {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": {} if finish else {"role": "assistant", "content": reply},
-            "finish_reason": "stop" if finish else None
-        }]
+        "choices": [
+            {
+                "index": 0,
+                "delta": {} if finish else {"role": "assistant", "content": reply},
+                "finish_reason": "stop" if finish else None,
+            }
+        ],
     }
+
     return f"data: {json.dumps(chunk)}\n\n"
 
 
-# ── CORE ROUTING LOGIC ────────────────────────────────────────────────────────
+# ── CORE ROUTING LOGIC ───────────────────────────────────────────────────────
 
 async def route_message(
     message: str,
@@ -242,25 +254,16 @@ async def route_message(
 ) -> tuple[str, bool, str]:
     """
     Central routing for all endpoints.
-    Returns: (reply, booking_active, context_used)
+    Returns: reply, booking_active, context_used
     """
     print(f"[route] session={session_id} is_voice={is_voice} message={message!r}")
 
-    # Active booking session always takes priority
-    if is_in_booking_flow(session_id):
-        print(f"[route] active booking session → booking handler")
-        reply, still_active = await handle_booking(session_id, message)
-        reply = safe_reply(reply, "I had a moment of trouble with the booking. Could you repeat that?")
-        return reply, still_active, "booking_flow"
-
-    # Detect intent via Groq
+    # Detect first so end-call works even during active booking.
     intent = await detect_intent(message)
     print(f"[route] intent={intent}")
 
-    if intent == "booking":
-        reply, still_active = await handle_booking(session_id, message)
-        reply = safe_reply(reply, "I'd love to help schedule an interview. What day works best for you?")
-        return reply, still_active, "booking_flow"
+    if intent == "end_call":
+        return "Goodbye. Have a good day.", False, "end_call"
 
     if intent == "adversarial":
         return (
@@ -269,6 +272,24 @@ async def route_message(
             False,
             "adversarial_guard"
         )
+
+    # Active booking flow has priority after end-call and adversarial guard.
+    if is_in_booking_flow(session_id):
+        print("[route] active booking session → booking handler")
+        reply, still_active = await handle_booking(session_id, message)
+        reply = safe_reply(
+            reply,
+            "I had a moment of trouble with the booking. Could you repeat that?"
+        )
+        return reply, still_active, "booking_flow"
+
+    if intent == "booking":
+        reply, still_active = await handle_booking(session_id, message)
+        reply = safe_reply(
+            reply,
+            "I'd love to help schedule an interview. What day works best for you?"
+        )
+        return reply, still_active, "booking_flow"
 
     if intent == "off_topic":
         return (
@@ -279,12 +300,7 @@ async def route_message(
             "off_topic_guard"
         )
 
-    # background / project / general → RAG + Groq
-    context = (
-        smart_retrieve_voice_context(message)
-        if is_voice
-        else smart_retrieve(message)
-    )
+    context = smart_retrieve_voice_context(message) if is_voice else smart_retrieve(message)
 
     reply = generate_groq_reply(
         message=message,
@@ -306,6 +322,7 @@ async def route_message(
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     message = req.message.strip()
+
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
@@ -319,12 +336,17 @@ async def chat(req: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    return ChatResponse(reply=reply, context_used=context_used, booking_active=booking_active)
+    return ChatResponse(
+        reply=reply,
+        context_used=context_used,
+        booking_active=booking_active
+    )
 
 
 @app.post("/voice", response_model=VoiceResponse)
 async def voice(req: VoiceRequest):
     message = req.message.strip()
+
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
@@ -337,12 +359,16 @@ async def voice(req: VoiceRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    return VoiceResponse(reply=reply, booking_active=booking_active)
+    return VoiceResponse(
+        reply=reply,
+        booking_active=booking_active
+    )
 
 
 @app.post("/vapi/chat/completions")
 async def vapi_chat_completions(req: VapiChatCompletionRequest):
     latest_message = extract_latest_user_message(req.messages)
+
     if not latest_message:
         latest_message = "Hello"
 
@@ -357,11 +383,13 @@ async def vapi_chat_completions(req: VapiChatCompletionRequest):
         )
     except Exception as e:
         print(f"[vapi] route_message failed: {e}")
-        reply = "I had trouble accessing Gaurav's information right now. Please try again in a moment."
+        reply = (
+            "I had trouble accessing Gaurav's information right now. "
+            "Please try again in a moment."
+        )
 
     print(f"[vapi] stream={req.stream} reply_length={len(reply)}")
 
-    # ── Streaming response (Vapi default) ─────────────────────────────────────
     if req.stream:
         async def generate():
             yield make_sse_chunk(reply, model_name, finish=False)
@@ -377,7 +405,6 @@ async def vapi_chat_completions(req: VapiChatCompletionRequest):
             }
         )
 
-    # ── Non-streaming fallback ────────────────────────────────────────────────
     return VapiChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
         created=int(time.time()),
@@ -392,6 +419,16 @@ async def vapi_chat_completions(req: VapiChatCompletionRequest):
     )
 
 
+@app.post("/vapi")
+async def vapi_direct(req: VapiChatCompletionRequest):
+    return await vapi_chat_completions(req)
+
+
+@app.post("/chat/completions")
+async def root_chat_completions(req: VapiChatCompletionRequest):
+    return await vapi_chat_completions(req)
+
+
 @app.get("/health")
 async def health():
     return {
@@ -401,7 +438,9 @@ async def health():
         "endpoints": {
             "chat": "/chat",
             "voice": "/voice",
-            "vapi": "/vapi/chat/completions"
+            "vapi_direct": "/vapi",
+            "vapi_openai": "/vapi/chat/completions",
+            "openai_compatible": "/chat/completions"
         }
     }
 
@@ -409,5 +448,8 @@ async def health():
 @app.get("/")
 async def root():
     return {
-        "message": f"AI Persona API for {YOUR_NAME}. POST to /chat, /voice, or /vapi/chat/completions"
+        "message": (
+            f"AI Persona API for {YOUR_NAME}. "
+            "POST to /chat, /voice, /vapi, /vapi/chat/completions, or /chat/completions"
+        )
     }

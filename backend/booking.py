@@ -5,11 +5,8 @@ Robust Cal.com v2 booking flow for chat + voice.
 Uses:
 - Cal.com for real slots and bookings
 - Groq as a meaning-extraction layer
+- Groq contact extraction for spoken emails
 - Backend state validation before any real booking/cancellation
-
-Changes from previous version:
-- Removed is_booking_intent() and BOOKING_KEYWORDS (now handled by intent.py)
-- Removed is_active_booking_session() (use is_in_booking_flow() only)
 """
 
 import os
@@ -31,6 +28,7 @@ CAL_USERNAME = os.environ["CAL_USERNAME"]
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+CONTACT_EXTRACTION_MODEL = os.getenv("CONTACT_EXTRACTION_MODEL", "llama-3.1-8b-instant")
 
 CAL_API_BASE = "https://api.cal.com/v2"
 CAL_SLOTS_API_VERSION = "2024-09-04"
@@ -97,7 +95,6 @@ def clear_session(session_id: str):
 
 
 def is_in_booking_flow(session_id: str) -> bool:
-    """Returns True if there is an active unfinished booking session."""
     session = sessions.get(session_id)
     return session is not None and session.stage != STAGE_CONFIRMED
 
@@ -230,8 +227,10 @@ async def fetch_all_slots() -> list[dict]:
             params=params,
             timeout=15
         )
+
         if response.status_code >= 400:
             raise Exception(f"Cal slots error {response.status_code}: {response.text}")
+
         data = response.json()
 
     raw_slots = data.get("data", {})
@@ -245,14 +244,22 @@ async def fetch_all_slots() -> list[dict]:
         iterable = raw_slots
 
     slots = []
+
     for slot in iterable:
         start_iso = parse_slot_start(slot)
+
         if not start_iso:
             continue
+
         start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
         ist_dt = to_ist(start_dt)
         label = ist_dt.strftime("%A, %d %b · %I:%M %p") + f" {TIMEZONE_LABEL}"
-        slots.append({"start": start_iso, "label": label, "dt": start_dt})
+
+        slots.append({
+            "start": start_iso,
+            "label": label,
+            "dt": start_dt,
+        })
 
     slots.sort(key=lambda s: s["dt"])
     return slots
@@ -268,7 +275,9 @@ async def create_booking(slot_start: str, guest_name: str, guest_email: str) -> 
             "timeZone": TIMEZONE_NAME,
             "language": "en"
         },
-        "metadata": {"source": "scaler-ai-persona"}
+        "metadata": {
+            "source": "scaler-ai-persona"
+        }
     }
 
     async with httpx.AsyncClient() as client:
@@ -278,13 +287,17 @@ async def create_booking(slot_start: str, guest_name: str, guest_email: str) -> 
             json=payload,
             timeout=15
         )
+
         if response.status_code >= 400:
             raise Exception(f"Cal booking error {response.status_code}: {response.text}")
+
         return response.json()
 
 
 async def cancel_booking(booking_uid: str, reason: str) -> dict:
-    payload = {"cancellationReason": reason or "Cancelled through Gaurav AI persona"}
+    payload = {
+        "cancellationReason": reason or "Cancelled through Gaurav AI persona"
+    }
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -293,36 +306,45 @@ async def cancel_booking(booking_uid: str, reason: str) -> dict:
             json=payload,
             timeout=15
         )
+
         if response.status_code >= 400:
             raise Exception(f"Cal cancel error {response.status_code}: {response.text}")
+
         return response.json()
 
 
-# ── GROQ MEANING PARSER ───────────────────────────────────────────────────────
+# ── JSON HELPERS ──────────────────────────────────────────────────────────────
 
 def safe_json_loads(text: str) -> dict:
     try:
         return json.loads(text)
     except Exception:
         pass
+
     match = re.search(r"\{.*\}", text, flags=re.S)
     if match:
         try:
             return json.loads(match.group())
         except Exception:
             return {}
+
     return {}
 
 
 def slot_snapshot(slots: list[dict]) -> list[dict]:
-    return [{"number": i, "label": s["label"], "start": s["start"]} for i, s in enumerate(slots, 1)]
+    return [
+        {
+            "number": i,
+            "label": s["label"],
+            "start": s["start"]
+        }
+        for i, s in enumerate(slots, 1)
+    ]
 
+
+# ── GROQ BOOKING PARSER ───────────────────────────────────────────────────────
 
 def parse_booking_message(user_message: str, session: BookingSession) -> dict:
-    """
-    Uses Groq only to understand meaning.
-    Does not perform booking/cancellation — backend validates everything.
-    """
     system_prompt = """
 You are a strict booking-message parser for an AI scheduling backend.
 
@@ -358,16 +380,17 @@ Return this exact schema:
 
 Stage rules:
 - cancel_reason: treat message as cancellation reason unless user clearly refuses
-- cancel_confirming: yes/agree → confirm_booking + confirmation true; no/refuse → deny_or_change + confirmation false
-- awaiting_confirmation: yes → confirm_booking + confirmation true; no/change → deny_or_change + confirmation false
-- showing_slots: pick slot → select_slot; other timings → show_more_slots; new preference → provide_preference
-- collecting_info: extract name/email → provide_contact
-- asking_preference: treat as availability preference → provide_preference
-- confirmed: cancel meeting → cancel_confirmed_booking; new booking → restart_flow
+- cancel_confirming: yes/agree -> confirm_booking + confirmation true; no/refuse -> deny_or_change + confirmation false
+- awaiting_confirmation: yes -> confirm_booking + confirmation true; no/change -> deny_or_change + confirmation false
+- showing_slots: pick slot -> select_slot; other timings -> show_more_slots; new preference -> provide_preference
+- collecting_info: extract name/email -> provide_contact
+- asking_preference: treat as availability preference -> provide_preference
+- confirmed: cancel meeting -> cancel_confirmed_booking; new booking -> restart_flow
 
 General:
-- Do not invent email, name, slot number, confirmation, or cancellation reason
-- If unclear return unknown
+- Do not invent email, name, slot number, confirmation, or cancellation reason.
+- If the user gives a spoken email, convert it to normal email only if you are confident.
+- If unclear return unknown.
 """.strip()
 
     user_payload = {
@@ -395,19 +418,30 @@ General:
             temperature=0,
             max_tokens=300,
         )
+
         raw = response.choices[0].message.content.strip()
         parsed = safe_json_loads(raw)
+
     except Exception as e:
         print(f"[booking] parse_booking_message failed: {e}")
         parsed = {}
 
     intent = parsed.get("intent") or "unknown"
+
     allowed = {
-        "provide_preference", "select_slot", "provide_contact",
-        "confirm_booking", "deny_or_change", "show_more_slots",
-        "cancel_flow", "cancel_confirmed_booking",
-        "provide_cancellation_reason", "restart_flow", "unknown",
+        "provide_preference",
+        "select_slot",
+        "provide_contact",
+        "confirm_booking",
+        "deny_or_change",
+        "show_more_slots",
+        "cancel_flow",
+        "cancel_confirmed_booking",
+        "provide_cancellation_reason",
+        "restart_flow",
+        "unknown",
     }
+
     if intent not in allowed:
         intent = "unknown"
 
@@ -423,37 +457,129 @@ General:
     }
 
 
-# ── DETERMINISTIC FALLBACKS ───────────────────────────────────────────────────
+# ── CONTACT EXTRACTION USING GROQ ─────────────────────────────────────────────
 
-EMAIL_PATTERN = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+")
+EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
 
-def extract_email_fallback(message: str) -> str:
-    match = EMAIL_PATTERN.search(message)
-    return match.group() if match else ""
+def is_valid_email(email: str) -> bool:
+    if not email:
+        return False
+
+    email = email.strip().lower()
+
+    if not EMAIL_PATTERN.fullmatch(email):
+        return False
+
+    if ".." in email:
+        return False
+
+    if email.startswith(".") or email.endswith("."):
+        return False
+
+    return True
 
 
 def clean_name(name: str | None) -> str:
     if not name:
         return ""
+
     name = re.sub(r"[^A-Za-z\s.'-]", " ", name)
-    return re.sub(r"\s+", " ", name).strip()[:80]
+    name = re.sub(r"\s+", " ", name).strip()
+
+    return name[:80]
 
 
 def clean_reason(reason: str | None) -> str:
     if not reason:
         return ""
-    return re.sub(r"\s+", " ", reason.strip())[:250]
 
+    reason = re.sub(r"\s+", " ", reason.strip())
+    return reason[:250]
+
+
+def extract_contact_with_groq(user_message: str, known_name: str = "", known_email: str = "") -> dict:
+    """
+    Uses Groq to extract attendee name and email from typed or spoken text.
+    No manual spoken-email mapping is used here.
+    """
+    system_prompt = """
+You extract contact details for a calendar booking.
+
+Return ONLY valid JSON:
+{
+  "name": null_or_string,
+  "email": null_or_string,
+  "email_confidence": "high" | "medium" | "low",
+  "needs_email_repeat": boolean
+}
+
+Rules:
+- Extract the attendee's full name if present.
+- Extract and normalize the email address if the user provides it in typed or spoken form.
+- Spoken examples may include: "at", "at the rate", "dot", "gmail dot com", numbers spoken as words.
+- Convert spoken email to a normal email ONLY if you are confident.
+- If the email is incomplete, ambiguous, or missing the username/domain, return email null and needs_email_repeat true.
+- Do not invent missing parts.
+- Do not guess a Gmail address unless the user clearly said it.
+- If an already known name/email is supplied, keep it unless the user clearly changes it.
+""".strip()
+
+    payload = {
+        "user_message": user_message,
+        "known_name": known_name or None,
+        "known_email": known_email or None,
+    }
+
+    try:
+        response = groq_client.chat.completions.create(
+            model=CONTACT_EXTRACTION_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+            ],
+            temperature=0,
+            max_tokens=120,
+        )
+
+        parsed = safe_json_loads(response.choices[0].message.content.strip())
+
+    except Exception as e:
+        print(f"[booking] contact extraction failed: {e}")
+        parsed = {}
+
+    name = clean_name(parsed.get("name") or known_name)
+    email = (parsed.get("email") or known_email or "").strip().lower()
+    email_confidence = parsed.get("email_confidence") or "low"
+    needs_email_repeat = bool(parsed.get("needs_email_repeat", False))
+
+    if not is_valid_email(email):
+        email = ""
+        needs_email_repeat = True
+
+    return {
+        "name": name,
+        "email": email,
+        "email_confidence": email_confidence,
+        "needs_email_repeat": needs_email_repeat,
+    }
+
+
+# ── SLOT MATCHING ─────────────────────────────────────────────────────────────
 
 def match_slot_by_number(slot_number: int | None, pending_slots: list[dict]) -> dict | None:
     if slot_number is None:
         return None
+
     try:
         index = int(slot_number) - 1
     except Exception:
         return None
-    return pending_slots[index] if 0 <= index < len(pending_slots) else None
+
+    if 0 <= index < len(pending_slots):
+        return pending_slots[index]
+
+    return None
 
 
 def normalize_for_match(text: str) -> str:
@@ -474,23 +600,27 @@ def match_slot_by_reference(reference: str | None, pending_slots: list[dict]) ->
         ist_dt = to_ist(slot["dt"])
         hour12 = ist_dt.hour % 12 or 12
         minute = ist_dt.minute
+
         time_patterns = [
             f"{hour12}",
             f"{hour12} pm" if ist_dt.hour >= 12 else f"{hour12} am",
             f"{hour12}:{minute:02d}",
         ]
+
         if any(p in ref for p in time_patterns):
             score += 3
 
         scored.append((score, slot))
 
-    scored = [(s, slot) for s, slot in scored if s > 0]
+    scored = [(score, slot) for score, slot in scored if score > 0]
     scored.sort(key=lambda x: x[0], reverse=True)
 
     if len(scored) == 1:
         return scored[0][1]
+
     if len(scored) >= 2 and scored[0][0] > scored[1][0]:
         return scored[0][1]
+
     return None
 
 
@@ -498,12 +628,14 @@ def match_slot_by_reference(reference: str | None, pending_slots: list[dict]) ->
 
 def render_slots(slots: list[dict]) -> str:
     lines = ["Here are the best matching available slots:"]
+
     for i, slot in enumerate(slots, 1):
         lines.append(f"{i}. {slot['label']}")
+
     lines.append(
-        "Which one works for you? Reply naturally — "
-        "'the second one', 'Monday 5 PM', or 'show other slots'."
+        "Which one works for you? You can say the slot number, the time, or ask for other slots."
     )
+
     return "\n".join(lines)
 
 
@@ -513,6 +645,7 @@ def show_current_slot_window(session: BookingSession) -> str:
             f"I don't see open slots in the next {SLOT_DAYS_AHEAD} days. "
             f"You can check more availability here: https://cal.com/{CAL_USERNAME}"
         )
+
     start = session.shown_offset
     session.pending_slots = session.filtered_slots[start:start + MAX_SLOTS_SHOWN]
 
@@ -527,14 +660,17 @@ def show_next_slot_window(session: BookingSession) -> str:
     if not session.filtered_slots:
         return (
             f"No more open slots in the next {SLOT_DAYS_AHEAD} days. "
-            f"Check availability at https://cal.com/{CAL_USERNAME}"
+            f"You can check availability at https://cal.com/{CAL_USERNAME}"
         )
+
     session.shown_offset += MAX_SLOTS_SHOWN
+
     if session.shown_offset >= len(session.filtered_slots):
         session.shown_offset = 0
         prefix = "I've looped back to the earliest available options.\n"
     else:
         prefix = "Here are some other available slots:\n"
+
     return prefix + show_current_slot_window(session)
 
 
@@ -556,12 +692,16 @@ async def show_slots_for_preference(session_id: str, preference_text: str) -> st
         all_slots = await fetch_all_slots()
     except Exception as e:
         return (
-            f"I had trouble fetching Gaurav's calendar right now ({str(e)}). "
-            f"You can also book directly at https://cal.com/{CAL_USERNAME}"
+            f"I had trouble fetching Gaurav's calendar right now. "
+            f"You can also book directly at https://cal.com/{CAL_USERNAME}."
         )
 
     session.all_slots = all_slots
-    filtered = [s for s in all_slots if slot_matches_preference(s["dt"], prefs)]
+
+    filtered = [
+        slot for slot in all_slots
+        if slot_matches_preference(slot["dt"], prefs)
+    ]
 
     if not filtered and prefs.get("strict_date"):
         requested_date = prefs["dates"][0].strftime("%A, %d %b")
@@ -585,43 +725,67 @@ async def handle_slot_selection(session_id: str, parsed: dict) -> str:
     session = get_session(session_id)
 
     selected = match_slot_by_number(parsed.get("slot_number"), session.pending_slots)
+
     if not selected:
         selected = match_slot_by_reference(parsed.get("slot_reference"), session.pending_slots)
 
     if not selected:
         slots_list = "\n".join(
-            f"{i + 1}. {s['label']}" for i, s in enumerate(session.pending_slots)
+            f"{i + 1}. {s['label']}"
+            for i, s in enumerate(session.pending_slots)
         )
-        return f"I couldn't identify which slot you meant. Please choose:\n{slots_list}"
+
+        return (
+            "I couldn't identify which slot you meant. Please choose one of these:\n"
+            f"{slots_list}"
+        )
 
     session.chosen_slot = selected
     session.stage = STAGE_COLLECTING_INFO
 
     return (
         f"Great, {session.chosen_slot['label']} works. "
-        "Please share the attendee's full name and email address for the calendar invite."
+        "Please share the attendee's full name and email address for the calendar invite. "
+        "For voice, please say the email slowly."
     )
 
 
 async def handle_contact_collection(session_id: str, parsed: dict, user_message: str) -> str:
     session = get_session(session_id)
 
-    parsed_name = clean_name(parsed.get("name"))
-    parsed_email = parsed.get("email") or extract_email_fallback(user_message)
+    contact = extract_contact_with_groq(
+        user_message=user_message,
+        known_name=session.guest_name,
+        known_email=session.guest_email,
+    )
 
-    if parsed_name:
-        session.guest_name = parsed_name
-    if parsed_email:
-        session.guest_email = parsed_email
+    if contact.get("name"):
+        session.guest_name = contact["name"]
+
+    if contact.get("email") and is_valid_email(contact["email"]):
+        session.guest_email = contact["email"]
 
     if not session.guest_name and not session.guest_email:
-        return "I need the attendee's name and email. For example: Rahul Sharma, rahul@email.com"
-
-    if not session.guest_email:
-        return "I got the name. Please share the attendee's email address."
+        return (
+            "I need the attendee's full name and email address. "
+            "Please say the name first, then the email slowly."
+        )
 
     if not session.guest_name:
         return "I got the email. Please share the attendee's full name."
+
+    if not session.guest_email:
+        return (
+            "I got the name, but I could not capture a valid email address clearly. "
+            "Please repeat the full email slowly. "
+            f"If voice is difficult, you can also book directly at https://cal.com/{CAL_USERNAME}."
+        )
+
+    if contact.get("email_confidence") == "low":
+        return (
+            f"I heard the email as {session.guest_email}. "
+            "Please confirm if that email is correct by saying yes, or repeat the email."
+        )
 
     session.stage = STAGE_AWAITING_CONFIRMATION
 
@@ -635,12 +799,20 @@ async def handle_contact_collection(session_id: str, parsed: dict, user_message:
 async def confirm_booking_action(session_id: str) -> tuple[str, bool]:
     session = get_session(session_id)
 
+    if not session.guest_name or not session.guest_email or not is_valid_email(session.guest_email):
+        session.stage = STAGE_COLLECTING_INFO
+        return (
+            "Before I book it, I need a valid attendee name and email address. "
+            "Please repeat the name and email slowly."
+        ), True
+
     try:
         confirmation = await create_booking(
             slot_start=session.chosen_slot["start"],
             guest_name=session.guest_name,
             guest_email=session.guest_email,
         )
+
         data = confirmation.get("data", confirmation)
         booking_id = data.get("uid") or data.get("id") or "N/A"
 
@@ -650,7 +822,7 @@ async def confirm_booking_action(session_id: str) -> tuple[str, bool]:
         session.stage = STAGE_CONFIRMED
 
         return (
-            f"All set! The interview is confirmed.\n\n"
+            "All set! The interview is confirmed.\n\n"
             f"Slot: **{session.confirmed_label}**\n"
             f"Name: {session.guest_name}\n"
             f"Confirmation ID: {booking_id}\n\n"
@@ -658,10 +830,11 @@ async def confirm_booking_action(session_id: str) -> tuple[str, bool]:
         ), False
 
     except Exception as e:
+        session.stage = STAGE_SHOWING_SLOTS
         return (
-            f"Something went wrong while booking: {str(e)}. "
-            f"Please try directly at https://cal.com/{CAL_USERNAME}"
-        ), False
+            "Something went wrong while booking. "
+            f"You can try another slot or book directly at https://cal.com/{CAL_USERNAME}."
+        ), True
 
 
 async def cancel_confirmed_booking_action(session_id: str) -> tuple[str, bool]:
@@ -674,32 +847,33 @@ async def cancel_confirmed_booking_action(session_id: str) -> tuple[str, bool]:
     reason = session.cancellation_reason or "Cancelled through Gaurav AI persona"
 
     try:
-        await cancel_booking(booking_uid=session.confirmed_booking_uid, reason=reason)
+        await cancel_booking(
+            booking_uid=session.confirmed_booking_uid,
+            reason=reason
+        )
+
         cancelled_label = session.confirmed_label
         clear_session(session_id)
+
         return (
             f"The booking for **{cancelled_label}** has been cancelled.\n"
             f"Reason: {reason}"
         ), False
-    except Exception as e:
+
+    except Exception:
         return (
-            f"I could not cancel automatically: {str(e)}. "
-            f"Please manage it at https://cal.com/{CAL_USERNAME}"
+            f"I could not cancel automatically. "
+            f"Please manage it directly at https://cal.com/{CAL_USERNAME}."
         ), False
 
 
 # ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
 
 async def handle_booking(session_id: str, user_message: str) -> tuple[str, bool]:
-    """
-    Central booking handler called by chat_api.py.
-    Returns (reply, still_active).
-    """
     session = get_session(session_id)
     parsed = parse_booking_message(user_message, session)
     intent = parsed["intent"]
 
-    # ── Cancellation reason collection ───────────────────────────────────────
     if session.stage == STAGE_CANCEL_REASON:
         if parsed.get("confirmation") is False or intent == "deny_or_change":
             session.stage = STAGE_CONFIRMED
@@ -707,6 +881,7 @@ async def handle_booking(session_id: str, user_message: str) -> tuple[str, bool]
             return "No problem. I have kept the booking as it is.", False
 
         reason = clean_reason(parsed.get("cancellation_reason") or user_message)
+
         if not reason:
             return "Please share a short reason for cancelling this interview.", True
 
@@ -718,39 +893,38 @@ async def handle_booking(session_id: str, user_message: str) -> tuple[str, bool]
             f"with reason: \"{session.cancellation_reason}\". Should I proceed?"
         ), True
 
-    # ── Cancellation confirmation ─────────────────────────────────────────────
     if session.stage == STAGE_CANCEL_CONFIRMING:
         if parsed.get("confirmation") is True or intent == "confirm_booking":
             return await cancel_confirmed_booking_action(session_id)
+
         if parsed.get("confirmation") is False or intent == "deny_or_change":
             session.stage = STAGE_CONFIRMED
             return "No problem. I have kept the booking as it is.", False
+
         return (
             f"Please confirm whether I should cancel the booking for **{session.confirmed_label}**."
         ), True
 
-    # ── Final booking confirmation ────────────────────────────────────────────
     if session.stage == STAGE_AWAITING_CONFIRMATION:
         if parsed.get("confirmation") is True or intent == "confirm_booking":
             return await confirm_booking_action(session_id)
+
         if parsed.get("confirmation") is False or intent == "deny_or_change":
             session.stage = STAGE_SHOWING_SLOTS
             return (
                 "No problem, I have not booked it. "
                 "Choose another slot, ask for more options, or say cancel."
             ), True
+
         return (
             "Please confirm before I create the calendar invite. "
             "Say yes to confirm, no to change, or cancel."
         ), True
 
-    # ── Global intents ────────────────────────────────────────────────────────
     if intent == "restart_flow":
         session = reset_session(session_id)
         session.stage = STAGE_ASKING_PREFERENCE
-        return (
-            "Sure, let's start again. What day and time works best for the interview?"
-        ), True
+        return "Sure, let's start again. What day and time works best for the interview?", True
 
     if intent == "cancel_flow":
         clear_session(session_id)
@@ -766,12 +940,12 @@ async def handle_booking(session_id: str, user_message: str) -> tuple[str, bool]
                 f"I found a confirmed booking for **{session.confirmed_label}**. "
                 "Could you share the reason for cancellation?"
             ), True
+
         return (
             "I don't have a confirmed booking in this session to cancel. "
-            f"You can manage bookings at https://cal.com/{CAL_USERNAME}"
+            f"You can manage bookings at https://cal.com/{CAL_USERNAME}."
         ), False
 
-    # ── Stage-based routing ───────────────────────────────────────────────────
     if session.stage == STAGE_STARTED:
         session.stage = STAGE_ASKING_PREFERENCE
         return stage_1_ask_preference(), True
@@ -784,13 +958,16 @@ async def handle_booking(session_id: str, user_message: str) -> tuple[str, bool]
     if session.stage == STAGE_SHOWING_SLOTS:
         if intent == "show_more_slots":
             return show_next_slot_window(session), True
+
         if intent == "select_slot":
             reply = await handle_slot_selection(session_id, parsed)
             return reply, True
+
         if intent == "provide_preference":
             preference_text = parsed.get("preference_text") or user_message
             reply = await show_slots_for_preference(session_id, preference_text)
             return reply, True
+
         return (
             "Please choose one of the shown slots, ask for other options, or say a new preferred time."
         ), True
@@ -805,6 +982,5 @@ async def handle_booking(session_id: str, user_message: str) -> tuple[str, bool]
             "If you want to cancel it, say you want to cancel the confirmed booking."
         ), False
 
-    # Fallback
     session.stage = STAGE_ASKING_PREFERENCE
     return stage_1_ask_preference(), True
