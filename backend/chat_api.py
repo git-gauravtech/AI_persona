@@ -7,12 +7,17 @@ Handles:
 2. RAG-grounded chat answers using Groq
 3. Short voice endpoint
 4. Vapi Custom LLM compatible endpoint
+5. Active booking route decision using Groq:
+   - continue booking
+   - pause booking and answer RAG question
+   - cancel booking flow
 """
 
 import os
 import time
 import uuid
 import json
+import re
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException
@@ -22,7 +27,12 @@ from pydantic import BaseModel, Field
 from groq import Groq
 
 from retrieve import smart_retrieve, smart_retrieve_voice_context
-from booking import is_in_booking_flow, handle_booking
+from booking import (
+    is_in_booking_flow,
+    handle_booking,
+    clear_session,
+    get_session,
+)
 from intent import detect_intent
 
 load_dotenv()
@@ -31,6 +41,7 @@ load_dotenv()
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_ROUTER_MODEL = os.getenv("GROQ_ROUTER_MODEL", "llama-3.1-8b-instant")
 
 YOUR_NAME = "Gaurav Saklani"
 TARGET_ROLE = "AI Engineer Intern at Scaler"
@@ -142,7 +153,25 @@ class VapiChatCompletionResponse(BaseModel):
     choices: list[VapiChoice]
 
 
-# ── HELPERS ──────────────────────────────────────────────────────────────────
+# ── JSON HELPERS ──────────────────────────────────────────────────────────────
+
+def safe_json_loads(text: str) -> dict:
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    if match:
+        try:
+            return json.loads(match.group())
+        except Exception:
+            return {}
+
+    return {}
+
+
+# ── GROQ HELPERS ──────────────────────────────────────────────────────────────
 
 def generate_groq_reply(
     message: str,
@@ -176,6 +205,116 @@ def generate_groq_reply(
 
     return response.choices[0].message.content.strip()
 
+
+def confirm_end_call_intent(message: str) -> bool:
+    """
+    Double-check end-call intent using Groq.
+    This avoids mistakes like treating "listen" as goodbye.
+    """
+    system_prompt = """
+You classify whether the user clearly wants to end the call.
+
+Return ONLY valid JSON:
+{
+  "end_call": true_or_false
+}
+
+Rules:
+- true only if user clearly wants to hang up, end the call, disconnect, or says a clear goodbye.
+- false if user is saying listen, wait, okay, asking a question, correcting the assistant, or continuing conversation.
+- If unsure, return false.
+""".strip()
+
+    payload = {"user_message": message}
+
+    try:
+        response = groq_client.chat.completions.create(
+            model=GROQ_ROUTER_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+            ],
+            temperature=0,
+            max_tokens=50,
+        )
+
+        parsed = safe_json_loads(response.choices[0].message.content.strip())
+        return bool(parsed.get("end_call", False))
+
+    except Exception as e:
+        print(f"[route] confirm_end_call_intent failed: {e}")
+        return False
+
+
+def decide_active_booking_route(message: str, session_stage: str) -> str:
+    """
+    Decide what to do when a booking session is already active.
+
+    Returns:
+    - continue_booking
+    - pause_for_rag
+    - cancel_booking_flow
+    - unknown
+    """
+    system_prompt = """
+You are a routing classifier for an AI assistant.
+
+A booking flow is currently active.
+Decide whether the user's latest message should continue the booking flow,
+temporarily answer a normal resume/project/background question,
+or cancel the current booking flow.
+
+Return ONLY valid JSON:
+{
+  "route": "continue_booking" | "pause_for_rag" | "cancel_booking_flow" | "unknown"
+}
+
+Rules:
+- continue_booking: user gives date/time preference, selects a slot, gives name/email, confirms, asks for more slots, asks about the current booking, wants to cancel a confirmed meeting, or says anything likely related to scheduling.
+- pause_for_rag: user asks a normal question about Gaurav's background, projects, skills, education, achievements, resume, GitHub, role fit, or experience, and it is not part of the booking step.
+- cancel_booking_flow: user clearly wants to stop or abandon the current unconfirmed scheduling process.
+- unknown: unclear.
+
+Important:
+- Do not rely on exact words.
+- Understand meaning from the message and current booking stage.
+- If unclear, choose continue_booking because an active booking flow should not break easily.
+""".strip()
+
+    payload = {
+        "current_booking_stage": session_stage,
+        "user_message": message,
+    }
+
+    try:
+        response = groq_client.chat.completions.create(
+            model=GROQ_ROUTER_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+            ],
+            temperature=0,
+            max_tokens=80,
+        )
+
+        parsed = safe_json_loads(response.choices[0].message.content.strip())
+        route = parsed.get("route", "unknown")
+
+        if route in {
+            "continue_booking",
+            "pause_for_rag",
+            "cancel_booking_flow",
+            "unknown",
+        }:
+            return route
+
+    except Exception as e:
+        print(f"[route] active booking route decision failed: {e}")
+
+    return "continue_booking"
+
+
+# ── VAPI HELPERS ──────────────────────────────────────────────────────────────
 
 def extract_latest_user_message(messages: list[dict]) -> str:
     for message in reversed(messages):
@@ -246,6 +385,28 @@ def make_sse_chunk(reply: str, model: str, finish: bool = False) -> str:
 
 # ── CORE ROUTING LOGIC ───────────────────────────────────────────────────────
 
+async def answer_rag(
+    message: str,
+    history: list[dict] | None,
+    is_voice: bool
+) -> tuple[str, str]:
+    context = smart_retrieve_voice_context(message) if is_voice else smart_retrieve(message)
+
+    reply = generate_groq_reply(
+        message=message,
+        context=context,
+        history=history,
+        is_voice=is_voice
+    )
+
+    reply = safe_reply(
+        reply,
+        "I'm having trouble accessing Gaurav's information right now. Please try again."
+    )
+
+    return reply, context
+
+
 async def route_message(
     message: str,
     session_id: str,
@@ -258,12 +419,47 @@ async def route_message(
     """
     print(f"[route] session={session_id} is_voice={is_voice} message={message!r}")
 
-    # Detect first so end-call works even during active booking.
+    # Active booking flow gets first priority.
+    # This avoids mistakes where "listen" or noisy voice text breaks the booking flow.
+    if is_in_booking_flow(session_id):
+        session = get_session(session_id)
+        active_route = decide_active_booking_route(message, session.stage)
+        print(f"[route] active_booking_route={active_route}")
+
+        if active_route == "cancel_booking_flow":
+            clear_session(session_id)
+            return (
+                "No problem, I’ve stopped the scheduling flow. "
+                "You can ask me again whenever you want to book a meeting.",
+                False,
+                "booking_flow_cancelled"
+            )
+
+        if active_route == "pause_for_rag":
+            reply, context = await answer_rag(
+                message=message,
+                history=history,
+                is_voice=is_voice
+            )
+            return reply, True, context
+
+        reply, still_active = await handle_booking(session_id, message)
+        reply = safe_reply(
+            reply,
+            "I had a moment of trouble with the booking. Could you repeat that?"
+        )
+        return reply, still_active, "booking_flow"
+
+    # Only detect general intent when no booking session is active.
     intent = await detect_intent(message)
     print(f"[route] intent={intent}")
 
     if intent == "end_call":
-        return "Goodbye. Have a good day.", False, "end_call"
+        if confirm_end_call_intent(message):
+            return "Goodbye. Have a good day.", False, "end_call"
+
+        print("[route] end_call rejected by confirmation layer")
+        intent = "background"
 
     if intent == "adversarial":
         return (
@@ -272,16 +468,6 @@ async def route_message(
             False,
             "adversarial_guard"
         )
-
-    # Active booking flow has priority after end-call and adversarial guard.
-    if is_in_booking_flow(session_id):
-        print("[route] active booking session → booking handler")
-        reply, still_active = await handle_booking(session_id, message)
-        reply = safe_reply(
-            reply,
-            "I had a moment of trouble with the booking. Could you repeat that?"
-        )
-        return reply, still_active, "booking_flow"
 
     if intent == "booking":
         reply, still_active = await handle_booking(session_id, message)
@@ -300,18 +486,10 @@ async def route_message(
             "off_topic_guard"
         )
 
-    context = smart_retrieve_voice_context(message) if is_voice else smart_retrieve(message)
-
-    reply = generate_groq_reply(
+    reply, context = await answer_rag(
         message=message,
-        context=context,
         history=history,
         is_voice=is_voice
-    )
-
-    reply = safe_reply(
-        reply,
-        "I'm having trouble accessing Gaurav's information right now. Please try again."
     )
 
     return reply, False, context
@@ -428,6 +606,7 @@ async def vapi_direct(req: VapiChatCompletionRequest):
 async def root_chat_completions(req: VapiChatCompletionRequest):
     return await vapi_chat_completions(req)
 
+
 @app.get("/health")
 async def health():
     return {
@@ -444,16 +623,7 @@ async def health():
 
 @app.head("/health")
 async def health_head():
-    return {
-            "status": "ok",
-            "model": GROQ_MODEL,
-            "candidate": YOUR_NAME,
-            "endpoints": {
-                "chat": "/chat",
-                "voice": "/voice",
-                "vapi": "/vapi/chat/completions"
-            }
-        }
+    return
 
 
 @app.get("/")
