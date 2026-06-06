@@ -11,9 +11,10 @@ PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
 INDEX_NAME = "ai-persona-local"
 NAMESPACE = "gaurav-ai-persona"
 
+# Must match embed_and_upsert.py
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
-TOP_K_CHAT = 7
+TOP_K_CHAT = 8
 TOP_K_VOICE = 5
 
 print(f"Loading FastEmbed retrieval model: {EMBEDDING_MODEL}")
@@ -60,6 +61,8 @@ REPO_ALIASES = {
         "bullmq",
         "dsl parser",
         "mermaid",
+        "question paper",
+        "assignment generation",
     ],
     "Indoor-plant-health-detection": [
         "indoor plant",
@@ -71,6 +74,7 @@ REPO_ALIASES = {
         "grad cam",
         "plant disease",
         "streamlit plant",
+        "plant leaf",
     ],
     "Agroshakti": [
         "agroshakti",
@@ -84,6 +88,7 @@ REPO_ALIASES = {
         "stt",
         "tts",
         "scheme search",
+        "agritech",
     ],
     "micromatch": [
         "micromatch",
@@ -97,6 +102,8 @@ REPO_ALIASES = {
     ],
 }
 
+
+# ── BASIC HELPERS ─────────────────────────────────────────────────────────────
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
@@ -158,6 +165,8 @@ def retrieve(
             "priority": metadata.get("priority", ""),
             "project_type": metadata.get("project_type", ""),
             "contribution_scope": metadata.get("contribution_scope", ""),
+            "section": metadata.get("section", ""),
+            "chunk_style": metadata.get("chunk_style", ""),
             "metadata": metadata,
         })
 
@@ -172,7 +181,9 @@ def dedupe_chunks(chunks: list[dict]) -> list[dict]:
         key = (
             chunk.get("source", ""),
             chunk.get("type", ""),
-            chunk.get("text", "")[:250],
+            chunk.get("section", ""),
+            chunk.get("chunk_style", ""),
+            chunk.get("text", "")[:280],
         )
 
         if key not in seen:
@@ -182,12 +193,35 @@ def dedupe_chunks(chunks: list[dict]) -> list[dict]:
     return unique
 
 
-def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
-    query_lower = normalize_text(query)
+def retrieve_many(searches: list[tuple[str, int, dict | None]]) -> list[dict]:
+    """
+    Run multiple retrieval routes and combine results.
+    Each item is: (query, top_k, metadata_filter)
+    """
+    all_chunks = []
 
-    broad_question = any(
-        phrase in query_lower
-        for phrase in [
+    for query, top_k, metadata_filter in searches:
+        try:
+            all_chunks.extend(
+                retrieve(
+                    query=query,
+                    top_k=top_k,
+                    metadata_filter=metadata_filter
+                )
+            )
+        except Exception as e:
+            print(f"[warn] Retrieval route failed: {e}")
+
+    return dedupe_chunks(all_chunks)
+
+
+# ── QUERY TYPE DETECTION ─────────────────────────────────────────────────────
+
+def detect_query_types(query: str) -> dict:
+    q = normalize_text(query)
+
+    return {
+        "broad": any(p in q for p in [
             "tell me about",
             "explain",
             "overview",
@@ -195,12 +229,9 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
             "what is",
             "what does",
             "describe",
-        ]
-    )
-
-    role_question = any(
-        phrase in query_lower
-        for phrase in [
+            "summary",
+        ]),
+        "role": any(p in q for p in [
             "role",
             "contribution",
             "contributed",
@@ -209,12 +240,9 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
             "worked on",
             "built",
             "responsibility",
-        ]
-    )
-
-    education_question = any(
-        phrase in query_lower
-        for phrase in [
+            "responsibilities",
+        ]),
+        "education": any(p in q for p in [
             "education",
             "currently doing",
             "current status",
@@ -236,12 +264,8 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
             "class 10",
             "high school",
             "schooling",
-        ]
-    )
-
-    achievement_question = any(
-        phrase in query_lower
-        for phrase in [
+        ]),
+        "achievement": any(p in q for p in [
             "achievement",
             "achievements",
             "award",
@@ -257,12 +281,10 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
             "research paper",
             "paper",
             "conference",
-        ]
-    )
-
-    fit_question = any(
-        phrase in query_lower
-        for phrase in [
+            "400",
+            "dsa",
+        ]),
+        "fit": any(p in q for p in [
             "fit",
             "good fit",
             "why hire",
@@ -278,12 +300,8 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
             "internship",
             "ai engineer",
             "scaler",
-        ]
-    )
-
-    architecture_question = any(
-        phrase in query_lower
-        for phrase in [
+        ]),
+        "architecture": any(p in q for p in [
             "architecture",
             "system design",
             "flow",
@@ -292,15 +310,14 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
             "api",
             "database",
             "websocket",
+            "socket",
             "queue",
             "worker",
             "deployment",
-        ]
-    )
-
-    ai_question = any(
-        phrase in query_lower
-        for phrase in [
+            "render",
+            "vercel",
+        ]),
+        "ai": any(p in q for p in [
             "ai",
             "llm",
             "model",
@@ -314,83 +331,191 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
             "deep learning",
             "tensorflow",
             "keras",
-        ]
-    )
+            "pinecone",
+            "vector",
+            "embedding",
+        ]),
+        "commit": any(p in q for p in [
+            "commit",
+            "commits",
+            "github history",
+            "git history",
+            "pull request",
+            "pull requests",
+            "pr",
+            "prs",
+            "what do his commits show",
+            "code contribution",
+        ]),
+        "project": any(p in q for p in [
+            "project",
+            "projects",
+            "github",
+            "repo",
+            "repository",
+            "portfolio",
+            "built",
+            "developed",
+        ]),
+        "contributed": any(p in q for p in [
+            "contributed",
+            "contribution",
+            "team project",
+            "worked with team",
+            "what part did",
+            "what did gaurav do in",
+            "did he build alone",
+            "built alone",
+            "solely built",
+            "contributed project",
+        ]),
+    }
+
+
+# ── RERANKING ────────────────────────────────────────────────────────────────
+
+def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
+    query_lower = normalize_text(query)
+    qtypes = detect_query_types(query)
+    detected_repo = detect_repo(query)
 
     def score_chunk(chunk: dict) -> float:
         text = chunk.get("text", "").lower()
+        source = chunk.get("source", "")
+        ctype = chunk.get("type", "")
+        chunk_style = chunk.get("chunk_style", "")
+        section = chunk.get("section", "").lower()
+
         score = float(chunk.get("score", 0))
 
+        # Exact repo boost
+        if detected_repo and source == detected_repo:
+            score += 0.45
+
+        # Priority/on-resume boosts
         if chunk.get("on_resume"):
+            score += 0.08
+
+        if chunk.get("priority") == "deep":
             score += 0.05
 
-        # Strong resume/background boosts
+        # New parse_data.py resume chunk style boosts
+        if chunk_style == "resume_fact":
+            score += 0.18
+
+        if chunk_style == "section_anchor":
+            score += 0.12
+
+        if chunk_style == "faq":
+            score += 0.20
+
+        # Metadata type boosts
+        if ctype == "readme_section":
+            score += 0.04
+
+        if ctype == "pull_request":
+            score += 0.08
+
+        if ctype == "commits":
+            if qtypes["commit"] or qtypes["role"] or qtypes["contributed"]:
+                score += 0.12
+            else:
+                score -= 0.01
+
+        # General resume/background boosts
         if "quick verified facts" in text:
             score += 0.35
+
         if "current education and status" in text:
             score += 0.35
+
         if "frequently asked verified answers" in text:
             score += 0.30
-        if "education" in text:
-            score += 0.18
+
+        if "education" in text or section == "education":
+            score += 0.16
+
         if "graphic era hill university" in text:
             score += 0.25
+
         if "b.tech" in text or "btech" in text:
-            score += 0.25
+            score += 0.22
+
         if "cgpa" in text:
-            score += 0.20
-        if "class 12" in text or "intermediate" in text:
-            score += 0.18
-        if "class 10" in text or "high school" in text:
-            score += 0.18
+            score += 0.16
+
         if "amazon ml summer school" in text:
             score += 0.18
+
         if "microsoft sefa" in text:
             score += 0.14
+
         if "patent" in text:
             score += 0.16
+
         if "publication" in text or "research paper" in text:
             score += 0.16
+
+        if "what makes gaurav a good fit" in text:
+            score += 0.28
+
         if "expectations from internship" in text:
             score += 0.15
-        if "what makes gaurav a good fit" in text:
-            score += 0.25
 
-        # Project section boosts
-        if "overview" in text:
+        # Project-level boosts
+        if "project summary" in text:
             score += 0.18
+
+        if "overview" in text:
+            score += 0.14
+
         if "my role" in text or "gaurav's role" in text:
             score += 0.25
+
         if "gaurav's contribution" in text:
             score += 0.25
+
         if "contribution scope" in text:
             score += 0.25
-        if "technical stack" in text or "tech stack" in text:
-            score += 0.06
-        if "architecture" in text:
-            score += 0.06
-        if "ai integration" in text:
-            score += 0.08
-        if "backend" in text:
-            score += 0.05
 
-        if broad_question:
+        if "important technical evidence" in text:
+            score += 0.20
+
+        if "rag answer support" in text:
+            score += 0.15
+
+        if "technical stack" in text or "tech stack" in text:
+            score += 0.08
+
+        if "architecture" in text:
+            score += 0.08
+
+        if "ai integration" in text:
+            score += 0.10
+
+        if "backend" in text:
+            score += 0.07
+
+        # Query-specific boosts
+        if qtypes["broad"]:
             if "summary" in text:
                 score += 0.12
             if "overview" in text:
                 score += 0.16
-            if "what makes gaurav a good fit" in text:
-                score += 0.18
+            if "project summary" in text:
+                score += 0.16
 
-        if role_question:
+        if qtypes["role"]:
             if "role" in text:
-                score += 0.20
+                score += 0.22
             if "contribution" in text:
-                score += 0.20
+                score += 0.25
             if "team project" in text:
-                score += 0.10
+                score += 0.12
+            if "not build the entire project alone" in text or "not built alone" in text:
+                score += 0.14
 
-        if education_question:
+        if qtypes["education"]:
             if "education" in text:
                 score += 0.35
             if "current education and status" in text:
@@ -400,14 +525,14 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
             if "b.tech" in text or "btech" in text:
                 score += 0.30
             if "cgpa" in text:
-                score += 0.22
+                score += 0.20
             if "class 12" in text or "intermediate" in text:
-                score += 0.20
+                score += 0.16
             if "class 10" in text or "high school" in text:
-                score += 0.20
+                score += 0.16
 
-        if achievement_question:
-            if "achievements" in text:
+        if qtypes["achievement"]:
+            if "achievements" in text or section in ["achievements", "honours and awards", "honors and awards"]:
                 score += 0.55
             if "amazon ml summer school" in text:
                 score += 0.30
@@ -415,20 +540,18 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
                 score += 0.20
             if "patent" in text:
                 score += 0.25
-            if "publication" in text:
+            if "publication" in text or "research paper" in text:
                 score += 0.25
-            if "leetcode" in text:
+            if "leetcode" in text or "400+" in text:
                 score += 0.18
             if "hackathon" in text:
-                score += 0.30
+                score += 0.25
 
-        if fit_question:
+        if qtypes["fit"]:
             if "what makes gaurav a good fit" in text:
-                score += 0.35
-            if "expectations from internship" in text:
-                score += 0.22
+                score += 0.38
             if "ai engineer intern" in text:
-                score += 0.20
+                score += 0.22
             if "scaler" in text:
                 score += 0.12
             if "production-ready ai applications" in text:
@@ -437,48 +560,92 @@ def rerank_chunks(query: str, chunks: list[dict]) -> list[dict]:
                 score += 0.08
             if "voice agents" in text:
                 score += 0.08
+            if "backend" in text:
+                score += 0.06
+            if "ai integration" in text:
+                score += 0.08
 
-        if architecture_question:
+        if qtypes["architecture"]:
             if "architecture" in text:
                 score += 0.22
             if "backend" in text:
+                score += 0.10
+            if "database" in text or "mongodb" in text or "postgresql" in text:
                 score += 0.08
-            if "database" in text:
-                score += 0.06
             if "websocket" in text or "socket.io" in text:
-                score += 0.06
+                score += 0.08
             if "bullmq" in text or "redis" in text:
+                score += 0.08
+            if "flask" in text or "fastapi" in text:
                 score += 0.06
-            if "flask" in text:
-                score += 0.05
+            if "deployment" in text or "render" in text or "vercel" in text:
+                score += 0.08
 
-        if ai_question:
+        if qtypes["ai"]:
             if "ai integration" in text:
                 score += 0.18
             if "llm" in text:
-                score += 0.08
+                score += 0.09
             if "prompt" in text:
-                score += 0.08
+                score += 0.09
+            if "rag" in text:
+                score += 0.10
             if "model" in text:
                 score += 0.06
             if "machine learning" in text:
-                score += 0.06
+                score += 0.08
             if "deep learning" in text:
-                score += 0.06
+                score += 0.08
             if "tensorflow" in text or "keras" in text:
-                score += 0.05
+                score += 0.06
+            if "pinecone" in text or "vector" in text:
+                score += 0.08
 
-        if chunk.get("type") == "readme_section":
-            score += 0.03
-        if chunk.get("type") == "pull_request":
-            score += 0.04
-        if chunk.get("type") == "commits":
-            score -= 0.02
+        if qtypes["commit"]:
+            if ctype == "commits":
+                score += 0.35
+            if ctype == "pull_request":
+                score += 0.30
+            if "original commit message" in text:
+                score += 0.20
+            if "expanded meaning" in text:
+                score += 0.22
+            if "important technical evidence" in text:
+                score += 0.25
+
+        if qtypes["contributed"]:
+            if chunk.get("ownership") == "contributed":
+                score += 0.35
+            if ctype == "pull_request":
+                score += 0.22
+            if "contributed repository" in text:
+                score += 0.20
+            if "did not build the entire project alone" in text:
+                score += 0.25
+            if "not build the entire project alone" in text:
+                score += 0.25
+            if "team" in text:
+                score += 0.10
+
+        # Small exact keyword match boost from user query terms
+        important_terms = [
+            term for term in query_lower.split()
+            if len(term) >= 5 and term not in {
+                "about", "gaurav", "tell", "explain", "what", "which", "where", "their", "there"
+            }
+        ]
+
+        for term in important_terms[:8]:
+            if term in text:
+                score += 0.025
 
         return score
 
-    return sorted(chunks, key=score_chunk, reverse=True)
+    reranked = sorted(chunks, key=score_chunk, reverse=True)
+    return reranked
 
+
+# ── CONTEXT FORMATTING ──────────────────────────────────────────────────────
 
 def format_context(chunks: list[dict]) -> str:
     if not chunks:
@@ -494,6 +661,12 @@ def format_context(chunks: list[dict]) -> str:
         )
 
         extra = []
+
+        if chunk.get("section"):
+            extra.append(f"Section: {chunk['section']}")
+
+        if chunk.get("chunk_style"):
+            extra.append(f"Chunk Style: {chunk['chunk_style']}")
 
         if chunk.get("role"):
             extra.append(f"Role: {chunk['role']}")
@@ -518,59 +691,35 @@ def format_context(chunks: list[dict]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+# ── SMART RETRIEVAL ─────────────────────────────────────────────────────────
+
 def smart_retrieve_chunks(query: str, top_k: int = TOP_K_CHAT) -> list[dict]:
     query_lower = normalize_text(query)
-
+    qtypes = detect_query_types(query)
     detected_repo = detect_repo(query)
 
+    searches = []
+
+    # 1. Repo-specific retrieval
     if detected_repo:
-        expanded_query = (
-            f"{query} overview my role Gaurav contribution contribution scope "
-            f"backend work AI integration technical stack architecture problem it solves "
-            f"design decisions challenges tradeoffs what would improve"
+        expanded_repo_query = (
+            f"{query} project summary overview my role Gaurav contribution contribution scope "
+            f"backend work AI integration technical stack architecture design decisions challenges "
+            f"tradeoffs what would improve commits pull requests important technical evidence"
         )
 
-        chunks = retrieve(
-            query=expanded_query,
-            top_k=max(top_k, 10),
-            metadata_filter={"source": detected_repo}
+        searches.append((expanded_repo_query, max(top_k, 14), {"source": detected_repo}))
+
+    # 2. Contribution/team-project retrieval
+    if qtypes["contributed"] or qtypes["role"]:
+        expanded_contribution_query = (
+            f"{query} Gaurav contribution contribution scope role team project not built alone "
+            f"backend feature work pull request commits important technical evidence"
         )
 
-        if chunks:
-            chunks = dedupe_chunks(chunks)
-            chunks = rerank_chunks(query, chunks)
-            return chunks[:top_k]
+        searches.append((expanded_contribution_query, max(top_k, 12), {"ownership": "contributed"}))
 
-    contributed_keywords = [
-        "contributed",
-        "contribution",
-        "team project",
-        "worked with team",
-        "what part did",
-        "what did gaurav do in",
-        "did he build alone",
-        "built alone",
-        "solely built",
-        "contributed project",
-    ]
-
-    if any(keyword in query_lower for keyword in contributed_keywords):
-        expanded_query = (
-            f"{query} Gaurav contribution contribution scope role "
-            f"team project not built alone backend feature work"
-        )
-
-        chunks = retrieve(
-            query=expanded_query,
-            top_k=max(top_k, 8),
-            metadata_filter={"ownership": "contributed"}
-        )
-
-        if chunks:
-            chunks = dedupe_chunks(chunks)
-            chunks = rerank_chunks(query, chunks)
-            return chunks[:top_k]
-
+    # 3. Resume/background retrieval
     resume_keywords = [
         "experience",
         "background",
@@ -632,30 +781,39 @@ def smart_retrieve_chunks(query: str, top_k: int = TOP_K_CHAT) -> list[dict]:
         "stipend",
     ]
 
-    if any(keyword in query_lower for keyword in resume_keywords):
-        expanded_query = (
-            f"{query} quick verified facts current education and status "
-            f"B.Tech Computer Science Engineering AI ML specialization Graphic Era Hill University "
-            f"CGPA 9.10 Class 12 Intermediate 90.8 Class 10 High School 95.2 "
-            f"skills achievements Amazon ML Summer School Microsoft SEFA patent publication "
-            f"LeetCode 400 questions rating 1530 AI Engineer Intern Scaler fit expectations internship "
+    should_search_resume = (
+        any(keyword in query_lower for keyword in resume_keywords)
+        or qtypes["education"]
+        or qtypes["achievement"]
+        or qtypes["fit"]
+    )
+
+    if should_search_resume:
+        expanded_resume_query = (
+            f"{query} quick verified facts resume fact section anchor current education status "
+            f"technical skills projects achievements fit AI Engineer Intern Scaler "
             f"RAG LLM prompt engineering backend AI integration voice agents"
         )
 
-        chunks = retrieve(
-            query=expanded_query,
-            top_k=max(top_k, 12),
-            metadata_filter={"on_resume": True}
+        searches.append((expanded_resume_query, max(top_k, 14), {"on_resume": True}))
+
+    # 4. AI/backend/project broad retrieval across all repos
+    if qtypes["ai"] or qtypes["architecture"] or qtypes["project"] or qtypes["commit"]:
+        expanded_project_query = (
+            f"{query} project summary overview technical evidence architecture backend AI ML "
+            f"deployment WebSocket queue worker database commits pull request contribution"
         )
 
-        if chunks:
-            chunks = dedupe_chunks(chunks)
-            chunks = rerank_chunks(query, chunks)
-            return chunks[:top_k]
+        searches.append((expanded_project_query, max(top_k, 14), None))
 
-    chunks = retrieve(query=query, top_k=top_k)
+    # 5. Fallback general retrieval
+    searches.append((query, max(top_k, 10), None))
+
+    chunks = retrieve_many(searches)
     chunks = dedupe_chunks(chunks)
-    return rerank_chunks(query, chunks)[:top_k]
+    chunks = rerank_chunks(query, chunks)
+
+    return chunks[:top_k]
 
 
 def smart_retrieve_context(query: str, top_k: int = TOP_K_CHAT) -> str:
@@ -671,6 +829,8 @@ def smart_retrieve_voice_context(query: str) -> str:
     chunks = smart_retrieve_chunks(query=query, top_k=TOP_K_VOICE)
     return format_context(chunks)
 
+
+# ── CLI TEST ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
@@ -689,7 +849,9 @@ if __name__ == "__main__":
             f"type={chunk['type']} | "
             f"score={chunk['score']} | "
             f"on_resume={chunk['on_resume']} | "
-            f"ownership={chunk['ownership']}"
+            f"ownership={chunk['ownership']} | "
+            f"section={chunk.get('section', '')} | "
+            f"chunk_style={chunk.get('chunk_style', '')}"
         )
 
     print("\n" + "=" * 80)

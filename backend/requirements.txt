@@ -6,3 +6,4 @@ pinecone
 fastembed
 httpx
 pydantic
+tqdm

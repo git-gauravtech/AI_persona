@@ -2,6 +2,11 @@
 parse_data.py
 Parses resume + all repo files into structured chunks with metadata.
 Output: data/processed/parsed_chunks.json
+
+RAG-optimized version:
+- Resume is split into section chunks, FAQ chunks, paragraph chunks, fact chunks, and anchor chunks.
+- README files are split by markdown headings.
+- commits.txt and prs.txt are split by semantic blocks like Commit Group, PR, Important technical evidence, and RAG answer support.
 """
 
 import json
@@ -19,8 +24,8 @@ except ImportError:
 DATA_DIR = Path("data")
 OUTPUT_FILE = DATA_DIR / "processed" / "parsed_chunks.json"
 
-MAX_CHARS = 1300
-OVERLAP_CHARS = 180
+MAX_CHARS = 1100
+OVERLAP_CHARS = 220
 
 
 # ── BASIC HELPERS ────────────────────────────────────────────────────────────
@@ -33,12 +38,19 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def split_long_text(text: str, max_chars: int = MAX_CHARS, overlap: int = OVERLAP_CHARS) -> list[str]:
+def split_long_text(
+    text: str,
+    max_chars: int = MAX_CHARS,
+    overlap: int = OVERLAP_CHARS
+) -> list[str]:
     """
     Split long text into overlapping chunks.
-    Tries to split on paragraph boundaries first.
+    Tries paragraph boundary first, then sentence/line boundary.
     """
     text = clean_text(text)
+
+    if not text:
+        return []
 
     if len(text) <= max_chars:
         return [text]
@@ -50,15 +62,15 @@ def split_long_text(text: str, max_chars: int = MAX_CHARS, overlap: int = OVERLA
         end = start + max_chars
 
         if end >= len(text):
-            chunks.append(clean_text(text[start:]))
+            final_chunk = clean_text(text[start:])
+            if final_chunk:
+                chunks.append(final_chunk)
             break
 
         window = text[start:end]
 
-        # Prefer paragraph break
         split_at = window.rfind("\n\n")
 
-        # Otherwise sentence break
         if split_at < max_chars * 0.45:
             split_at = max(window.rfind(". "), window.rfind("\n"))
 
@@ -69,9 +81,12 @@ def split_long_text(text: str, max_chars: int = MAX_CHARS, overlap: int = OVERLA
         if chunk:
             chunks.append(chunk)
 
-        start = start + split_at - overlap
-        if start < 0:
-            start = 0
+        new_start = start + split_at - overlap
+
+        if new_start <= start:
+            new_start = start + split_at
+
+        start = max(new_start, 0)
 
     return chunks
 
@@ -120,6 +135,7 @@ RESUME_HEADINGS = [
 
 def is_heading_line(line: str) -> bool:
     line = line.strip()
+
     if not line:
         return False
 
@@ -157,6 +173,7 @@ def split_resume_sections(text: str) -> list[tuple[str, str]]:
 
             current_title = stripped
             current_lines = [stripped]
+
         else:
             current_lines.append(line)
 
@@ -168,7 +185,14 @@ def split_resume_sections(text: str) -> list[tuple[str, str]]:
     return sections
 
 
-def make_resume_chunk(text: str, txt_path: Path, section_title: str, section_index: int, chunk_index: int, chunk_style: str) -> dict:
+def make_resume_chunk(
+    text: str,
+    txt_path: Path,
+    section_title: str,
+    section_index: int,
+    chunk_index: int,
+    chunk_style: str
+) -> dict:
     return {
         "text": text,
         "metadata": {
@@ -184,6 +208,78 @@ def make_resume_chunk(text: str, txt_path: Path, section_title: str, section_ind
             "priority": "deep",
         }
     }
+
+
+def looks_like_important_resume_line(line: str) -> bool:
+    """
+    Detect dense resume facts that should become separate retrieval chunks.
+    This helps indirect questions like:
+    - Why is Gaurav fit for AI Engineer?
+    - What backend experience does he have?
+    - What achievements does he have?
+    """
+    stripped = line.strip()
+    lowered = stripped.lower()
+
+    if len(stripped) < 45:
+        return False
+
+    starts_good = stripped.startswith(("-", "*", "•"))
+
+    keyword_hit = any(k in stripped for k in [
+        "Project:",
+        "Skills:",
+        "Tech Stack:",
+        "Achievement:",
+        "Role:",
+        "Built",
+        "Developed",
+        "Implemented",
+        "Integrated",
+        "Optimized",
+        "Deployed",
+        "Created",
+        "Designed",
+        "Worked",
+        "Experience",
+        "GitHub",
+        "LinkedIn",
+        "Hackathon",
+        "Amazon ML Summer School",
+        "DSA",
+        "RAG",
+        "LLM",
+        "AI",
+        "ML",
+        "Backend",
+        "Flask",
+        "FastAPI",
+        "MongoDB",
+        "Pinecone",
+        "Groq",
+        "Vapi",
+        "Cal.com",
+    ])
+
+    signal_hit = any(k in lowered for k in [
+        "b.tech",
+        "computer science",
+        "artificial intelligence",
+        "machine learning",
+        "backend developer",
+        "ai integration",
+        "400+",
+        "leetcode",
+        "codeforces",
+        "hackathon",
+        "intern",
+        "rag",
+        "fine-tuning",
+        "prompt engineering",
+        "vector database",
+    ])
+
+    return starts_good or keyword_hit or signal_hit
 
 
 def parse_txt_resume(txt_path: Path) -> list[dict]:
@@ -202,8 +298,9 @@ def parse_txt_resume(txt_path: Path) -> list[dict]:
         if len(section_text) < 30:
             continue
 
-        # 1. Full section chunks, split if too long
-        full_parts = split_long_text(section_text, max_chars=1600, overlap=180)
+        # 1. Full section chunks
+        full_parts = split_long_text(section_text, max_chars=1500, overlap=220)
+
         for part_index, part in enumerate(full_parts):
             chunks.append(
                 make_resume_chunk(
@@ -216,9 +313,10 @@ def parse_txt_resume(txt_path: Path) -> list[dict]:
                 )
             )
 
-        # 2. FAQ chunks: each Q/A becomes its own chunk
+        # 2. FAQ chunks: each Question/Answer becomes separate chunk
         if "Question:" in section_text:
             faq_blocks = re.split(r"(?=Question:)", section_text)
+
             for faq_index, block in enumerate(faq_blocks):
                 block = clean_text(block)
 
@@ -231,7 +329,7 @@ def parse_txt_resume(txt_path: Path) -> list[dict]:
                         txt_path=txt_path,
                         section_title=section_title,
                         section_index=section_index,
-                        chunk_index=faq_index,
+                        chunk_index=1000 + faq_index,
                         chunk_style="faq",
                     )
                 )
@@ -245,14 +343,11 @@ def parse_txt_resume(txt_path: Path) -> list[dict]:
             if len(para) < 80:
                 continue
 
-            # Avoid exact duplicate of full section
             if para == section_text:
                 continue
 
             paragraph_text = f"{section_title}\n\n{para}"
-
-            # Split large paragraphs too
-            para_parts = split_long_text(paragraph_text, max_chars=1000, overlap=120)
+            para_parts = split_long_text(paragraph_text, max_chars=950, overlap=150)
 
             for sub_index, para_part in enumerate(para_parts):
                 chunks.append(
@@ -261,10 +356,51 @@ def parse_txt_resume(txt_path: Path) -> list[dict]:
                         txt_path=txt_path,
                         section_title=section_title,
                         section_index=section_index,
-                        chunk_index=(para_index * 100) + sub_index,
+                        chunk_index=(2000 + para_index * 100) + sub_index,
                         chunk_style="paragraph",
                     )
                 )
+
+        # 4. Important resume fact chunks
+        important_lines = []
+
+        for line in section_text.splitlines():
+            line = clean_text(line)
+
+            if looks_like_important_resume_line(line):
+                important_lines.append(line)
+
+        for line_index, line in enumerate(important_lines):
+            chunks.append(
+                make_resume_chunk(
+                    text=f"{section_title}\n\nVerified resume fact:\n{line}",
+                    txt_path=txt_path,
+                    section_title=section_title,
+                    section_index=section_index,
+                    chunk_index=9000 + line_index,
+                    chunk_style="resume_fact",
+                )
+            )
+
+        # 5. Section anchor chunk for indirect questions
+        summary_anchor = clean_text(
+            f"Resume section: {section_title}\n"
+            f"This section contains verified information about Gaurav Saklani related to {section_title}. "
+            f"Use this section when answering recruiter questions about Gaurav's {section_title.lower()}.\n\n"
+            f"{section_text[:1200]}"
+        )
+
+        if len(summary_anchor) > 120:
+            chunks.append(
+                make_resume_chunk(
+                    text=summary_anchor,
+                    txt_path=txt_path,
+                    section_title=section_title,
+                    section_index=section_index,
+                    chunk_index=9900,
+                    chunk_style="section_anchor",
+                )
+            )
 
     return chunks
 
@@ -279,6 +415,7 @@ def parse_resume(pdf_path: Path) -> list[dict]:
 
     with pdfplumber.open(pdf_path) as pdf:
         pages = []
+
         for page in pdf.pages:
             page_text = page.extract_text() or ""
             pages.append(page_text)
@@ -291,9 +428,9 @@ def parse_resume(pdf_path: Path) -> list[dict]:
 
     temp_txt_path = pdf_path.with_suffix(".txt")
     temp_txt_path.write_text(full_text, encoding="utf-8")
+
     chunks = parse_txt_resume(temp_txt_path)
 
-    # Fix metadata file path/source
     for chunk in chunks:
         chunk["metadata"]["file"] = str(pdf_path)
         chunk["metadata"]["source"] = "resume"
@@ -311,11 +448,97 @@ def parse_resume(pdf_path: Path) -> list[dict]:
 def infer_file_type(stem: str) -> str:
     if stem == "readme":
         return "readme_section"
+
     if stem == "commits":
         return "commits"
+
     if stem == "prs":
         return "pull_request"
+
     return stem
+
+
+def split_structured_repo_text(text: str, file_type: str) -> list[str]:
+    """
+    Split commits.txt and prs.txt using meaningful RAG boundaries.
+    Works with:
+    - Project Summary
+    - Commit Group 1 / Commit 1
+    - PR #1 / PR 1
+    - Important technical evidence
+    - RAG answer support
+    """
+    text = clean_text(text)
+
+    if not text:
+        return []
+
+    if file_type == "commits":
+        pattern = (
+            r"(?=\n?(?:"
+            r"Project Summary:|"
+            r"Commit Group \d+|"
+            r"Commit \d+|"
+            r"Important technical evidence|"
+            r"ML Model Evidence|"
+            r"Dataset Evidence|"
+            r"RAG answer support"
+            r"):?)"
+        )
+
+    elif file_type == "prs":
+        pattern = (
+            r"(?=\n?(?:"
+            r"PR Evidence Status:|"
+            r"PR #\d+|"
+            r"PR \d+|"
+            r"Known contribution evidence|"
+            r"Contribution Summary|"
+            r"Supported contribution areas|"
+            r"Important caution for RAG|"
+            r"AI/ML caution|"
+            r"RAG answer support"
+            r"):?)"
+        )
+
+    else:
+        return split_long_text(text, max_chars=1100, overlap=180)
+
+    parts = re.split(pattern, text)
+    chunks = []
+
+    # Keep repository/role header attached to each chunk
+    header_lines = []
+
+    for line in text.splitlines():
+        line = line.strip()
+
+        if not line:
+            continue
+
+        if re.match(
+            r"^(Project Summary:|Commit Group \d+|Commit \d+|PR Evidence Status:|PR #\d+|PR \d+|Known contribution evidence|Contribution Summary|Important technical evidence|RAG answer support)",
+            line
+        ):
+            break
+
+        header_lines.append(line)
+
+    header = clean_text("\n".join(header_lines[:10]))
+
+    for part in parts:
+        part = clean_text(part)
+
+        if len(part) < 40:
+            continue
+
+        if header and not part.startswith("Repository:") and header not in part[:500]:
+            part = clean_text(header + "\n\n" + part)
+
+        sub_parts = split_long_text(part, max_chars=1200, overlap=180)
+        chunks.extend(sub_parts)
+
+    return chunks
 
 
 def parse_txt_file(
@@ -343,7 +566,7 @@ def parse_txt_file(
         parts = re.split(r"\n(?=#{1,4}\s+)", text)
 
         if len(parts) <= 1:
-            parts = split_long_text(text, max_chars=1400, overlap=160)
+            parts = split_long_text(text, max_chars=1300, overlap=180)
 
         for idx, part in enumerate(parts):
             part = clean_text(part)
@@ -351,7 +574,7 @@ def parse_txt_file(
             if len(part) < 40:
                 continue
 
-            sub_parts = split_long_text(part, max_chars=1400, overlap=160)
+            sub_parts = split_long_text(part, max_chars=1300, overlap=180)
 
             for sub_idx, sub_part in enumerate(sub_parts):
                 chunks.append({
@@ -364,50 +587,31 @@ def parse_txt_file(
                         "chunk_index": (idx * 100) + sub_idx,
                         "ownership": ownership,
                         "on_resume": on_resume,
+                        "priority": "deep" if on_resume else repo_metadata.get("priority", "medium"),
                     }
                 })
 
-    # COMMITS / PRS: split by bullet batches
+    # commits.txt / prs.txt: semantic chunks
     else:
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        batch = []
-        batch_index = 0
+        semantic_parts = split_structured_repo_text(text, file_type=file_type)
 
-        for line in lines:
-            batch.append(line)
+        for idx, part in enumerate(semantic_parts):
+            part = clean_text(part)
 
-            if len("\n".join(batch)) >= 900:
-                chunk_text = "\n".join(batch)
-
-                chunks.append({
-                    "text": chunk_text,
-                    "metadata": {
-                        **repo_metadata,
-                        "source": repo_name,
-                        "type": parsed_type,
-                        "file": str(file_path),
-                        "chunk_index": batch_index,
-                        "ownership": ownership,
-                        "on_resume": on_resume,
-                    }
-                })
-
-                batch = []
-                batch_index += 1
-
-        if batch:
-            chunk_text = "\n".join(batch)
+            if len(part) < 40:
+                continue
 
             chunks.append({
-                "text": chunk_text,
+                "text": part,
                 "metadata": {
                     **repo_metadata,
                     "source": repo_name,
                     "type": parsed_type,
                     "file": str(file_path),
-                    "chunk_index": batch_index,
+                    "chunk_index": idx,
                     "ownership": ownership,
                     "on_resume": on_resume,
+                    "priority": "deep" if on_resume else repo_metadata.get("priority", "medium"),
                 }
             })
 
@@ -435,6 +639,7 @@ def parse_repos(repos_dir: Path) -> list[dict]:
             repo_metadata = load_repo_metadata(repo_dir)
 
             clean_name = repo_metadata.get("repo_name") or folder_name.replace("resume_", "")
+
             repo_metadata["priority"] = repo_metadata.get(
                 "priority",
                 "deep" if on_resume else "medium"
@@ -460,6 +665,7 @@ def parse_repos(repos_dir: Path) -> list[dict]:
                         on_resume=on_resume,
                         repo_metadata=repo_metadata,
                     )
+
                     all_chunks.extend(chunks)
                     print(f"    {file_path.name} → {len(chunks)} chunks")
 
@@ -503,8 +709,13 @@ def main():
         repo_chunks = parse_repos(repos_dir)
         all_chunks.extend(repo_chunks)
         print(f"\n  → {len(repo_chunks)} total chunks from repos")
+
     else:
         print(f"[warn] Repos dir not found at {repos_dir}")
+
+    # Add global chunk index for easier debugging
+    for idx, chunk in enumerate(all_chunks):
+        chunk["metadata"]["global_chunk_index"] = idx
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(all_chunks, f, indent=2, ensure_ascii=False)
