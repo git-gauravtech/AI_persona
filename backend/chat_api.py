@@ -6,16 +6,18 @@ Handles:
 1. Booking flow (via booking.py)
 2. RAG-grounded chat answers using Groq
 3. Short voice endpoint
-4. Vapi Custom LLM compatible endpoint
+4. Vapi Custom LLM compatible endpoint (streaming + non-streaming)
 """
 
 import os
 import time
 import uuid
+import json
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from groq import Groq
 
@@ -208,11 +210,26 @@ def extract_vapi_session_id(req: VapiChatCompletionRequest) -> str:
 
 
 def safe_reply(reply: str, fallback: str) -> str:
-    """Never return empty string to Vapi or chat."""
     if reply and reply.strip():
         return reply.strip()
     print(f"[warn] Empty reply detected, using fallback")
     return fallback
+
+
+def make_sse_chunk(reply: str, model: str, finish: bool = False) -> str:
+    """Build a single SSE chunk in OpenAI streaming format."""
+    chunk = {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {} if finish else {"role": "assistant", "content": reply},
+            "finish_reason": "stop" if finish else None
+        }]
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
 
 
 # ── CORE ROUTING LOGIC ────────────────────────────────────────────────────────
@@ -229,7 +246,7 @@ async def route_message(
     """
     print(f"[route] session={session_id} is_voice={is_voice} message={message!r}")
 
-    # Active booking session always takes priority — no intent check needed
+    # Active booking session always takes priority
     if is_in_booking_flow(session_id):
         print(f"[route] active booking session → booking handler")
         reply, still_active = await handle_booking(session_id, message)
@@ -323,13 +340,14 @@ async def voice(req: VoiceRequest):
     return VoiceResponse(reply=reply, booking_active=booking_active)
 
 
-@app.post("/vapi/chat/completions", response_model=VapiChatCompletionResponse)
+@app.post("/vapi/chat/completions")
 async def vapi_chat_completions(req: VapiChatCompletionRequest):
     latest_message = extract_latest_user_message(req.messages)
     if not latest_message:
         latest_message = "Hello"
 
     session_id = extract_vapi_session_id(req)
+    model_name = req.model or "gaurav-ai-persona"
 
     try:
         reply, _, _ = await route_message(
@@ -339,15 +357,31 @@ async def vapi_chat_completions(req: VapiChatCompletionRequest):
         )
     except Exception as e:
         print(f"[vapi] route_message failed: {e}")
-        reply = (
-            "I had trouble accessing Gaurav's information right now. "
-            "Please try again in a moment."
+        reply = "I had trouble accessing Gaurav's information right now. Please try again in a moment."
+
+    print(f"[vapi] stream={req.stream} reply_length={len(reply)}")
+
+    # ── Streaming response (Vapi default) ─────────────────────────────────────
+    if req.stream:
+        async def generate():
+            yield make_sse_chunk(reply, model_name, finish=False)
+            yield make_sse_chunk("", model_name, finish=True)
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            }
         )
 
+    # ── Non-streaming fallback ────────────────────────────────────────────────
     return VapiChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
         created=int(time.time()),
-        model=req.model or "gaurav-ai-persona",
+        model=model_name,
         choices=[
             VapiChoice(
                 index=0,
