@@ -1,8 +1,6 @@
 # Gaurav Saklani AI Persona
 
-An end-to-end AI persona built for the **Scaler AI Engineer Intern Screening Assignment**.
-
-The system allows recruiters to interact with Gaurav Saklani’s AI representative through both:
+The system allows recruiters to interact with my AI representative through both:
 
 * A public chat interface
 * A phone-call based voice agent
