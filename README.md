@@ -13,7 +13,7 @@ The persona can answer questions about Gaurav’s resume, education, projects, G
 
 | Item                     | Link                                      |
 | ------------------------ | ----------------------------------------- |
-| Public Chat URL          | https://scaler-ai-persona-phi.vercel.app/ |
+| Public Chat URL          | https://ai-persona-phi.vercel.app/        |
 | Voice Agent Phone Number | +1669268XXXX                              |
 
 ---
